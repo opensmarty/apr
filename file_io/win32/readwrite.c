@@ -31,7 +31,6 @@
 static apr_status_t read_with_timeout(apr_file_t *file, void *buf, apr_size_t len_in, apr_size_t *nbytes)
 {
     apr_status_t rv;
-    DWORD res;
     DWORD len = (DWORD)len_in;
     DWORD bytesread = 0;
 
@@ -80,26 +79,33 @@ static apr_status_t read_with_timeout(apr_file_t *file, void *buf, apr_size_t le
     else {
         rv = apr_get_os_error();
         if (rv == APR_FROM_OS_ERROR(ERROR_IO_PENDING)) {
-            /* Wait for the pending i/o, timeout converted from us to ms
-             * Note that we loop if someone gives up the event, since
-             * folks suggest that WAIT_ABANDONED isn't actually a result
-             * but an alert that ownership of the event has passed from
-             * one owner to a new proc/thread.
-             */
-            do {
-                res = WaitForSingleObject(file->pOverlapped->hEvent, 
-                                          (file->timeout > 0)
-                                            ? (DWORD)(file->timeout/1000)
-                                            : ((file->timeout == -1) 
-                                                 ? INFINITE : 0));
-            } while (res == WAIT_ABANDONED);
+            DWORD res;
+
+            /* It seems that ReadFile() return ERROR_IO_PENDING even
+             * when I/O operation completed syncronously.
+             * Use fast macro to check that overlapped I/O already
+             * completed to avoid kernel call.
+             */ 
+            if (HasOverlappedIoCompleted(file->pOverlapped)) {
+                res = WAIT_OBJECT_0;
+            }
+            else {
+                /* Wait for the pending i/o, timeout converted from us to ms
+                 * Note that we loop if someone gives up the event.
+                 *
+                 * NOTE: We do not handle WAIT_ABANDONED here because they
+                 * can be returned only when waiting for mutex.
+                 */
+                res = apr_wait_for_single_object(file->pOverlapped->hEvent,
+                                                 file->timeout);
+            }
 
             /* There is one case that represents entirely
              * successful operations, otherwise we will cancel
              * the operation in progress.
              */
             if (res != WAIT_OBJECT_0) {
-                CancelIo(file->filehand);
+                CancelIoEx(file->filehand, file->pOverlapped);
             }
 
             /* Ignore any failures above.  Attempt to complete
@@ -241,7 +247,7 @@ APR_DECLARE(apr_status_t) apr_file_read(apr_file_t *thefile, void *buf, apr_size
     if ((thefile->flags & APR_FOPEN_XTHREAD) && !thefile->pOverlapped ) {
         thefile->pOverlapped = (OVERLAPPED*) apr_pcalloc(thefile->pool, 
                                                          sizeof(OVERLAPPED));
-        thefile->pOverlapped->hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+        thefile->pOverlapped->hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
         if (!thefile->pOverlapped->hEvent) {
             rv = apr_get_os_error();
             return rv;
@@ -388,7 +394,7 @@ APR_DECLARE(apr_status_t) apr_file_write(apr_file_t *thefile, const void *buf, a
     if ((thefile->flags & APR_FOPEN_XTHREAD) && !thefile->pOverlapped ) {
         thefile->pOverlapped = (OVERLAPPED*) apr_pcalloc(thefile->pool, 
                                                          sizeof(OVERLAPPED));
-        thefile->pOverlapped->hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+        thefile->pOverlapped->hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
         if (!thefile->pOverlapped->hEvent) {
             rv = apr_get_os_error();
             return rv;
@@ -490,41 +496,52 @@ APR_DECLARE(apr_status_t) apr_file_write(apr_file_t *thefile, const void *buf, a
             (*nbytes) = 0;
             rv = apr_get_os_error();
 
-            /* XXX: This must be corrected, per the apr_file_read logic!!! */
             if (rv == APR_FROM_OS_ERROR(ERROR_IO_PENDING)) {
  
-                DWORD timeout_ms;
+                DWORD res;
 
-                if (thefile->timeout == 0) {
-                    timeout_ms = 0;
-                }
-                else if (thefile->timeout < 0) {
-                    timeout_ms = INFINITE;
+                /* It seems that WriteFile() return ERROR_IO_PENDING even
+                 * when I/O operation completed syncronously.
+                 * Use fast macro to check that overlapped I/O already
+                 * completed to avoid kernel call.
+                 */
+                if (HasOverlappedIoCompleted(thefile->pOverlapped)) {
+                    res = WAIT_OBJECT_0;
                 }
                 else {
-                    timeout_ms = (DWORD)(thefile->timeout / 1000);
+                    res = apr_wait_for_single_object(thefile->pOverlapped->hEvent,
+                                                     thefile->timeout);
                 }
-	       
-                rv = WaitForSingleObject(thefile->pOverlapped->hEvent, timeout_ms);
-                switch (rv) {
-                    case WAIT_OBJECT_0:
-                        GetOverlappedResult(thefile->filehand, thefile->pOverlapped, 
-                                            &bwrote, TRUE);
-                        *nbytes = bwrote;
-                        rv = APR_SUCCESS;
-                        break;
-                    case WAIT_TIMEOUT:
-                        rv = (timeout_ms == 0) ? APR_EAGAIN : APR_TIMEUP;
-                        break;
-                    case WAIT_FAILED:
-                        rv = apr_get_os_error();
-                        break;
-                    default:
-                        break;
+
+                /* There is one case that represents entirely
+                 * successful operations, otherwise we will cancel
+                 * the operation in progress.
+                 */
+                if (res != WAIT_OBJECT_0) {
+                    CancelIoEx(thefile->filehand, thefile->pOverlapped);
                 }
-                if (rv != APR_SUCCESS) {
-                    if (apr_os_level >= APR_WIN_98)
-                        CancelIo(thefile->filehand);
+
+                /* Ignore any failures above.  Attempt to complete
+                 * the overlapped operation and use only _its_ result.
+                 * For example, CancelIo or WaitForSingleObject can
+                 * fail if the handle is closed, yet the read may have
+                 * completed before we attempted to CancelIo...
+                 */
+                if (GetOverlappedResult(thefile->filehand, thefile->pOverlapped,
+                                        &bwrote, TRUE)) {
+                    *nbytes = bwrote;
+                    rv = APR_SUCCESS;
+                }
+                else {
+                    rv = apr_get_os_error();
+                    if (((rv == APR_FROM_OS_ERROR(ERROR_IO_INCOMPLETE))
+                        || (rv == APR_FROM_OS_ERROR(ERROR_OPERATION_ABORTED)))
+                        && (res == WAIT_TIMEOUT))
+                        rv = APR_TIMEUP;
+
+                    if (rv == APR_TIMEUP && thefile->timeout == 0) {
+                        rv = APR_EAGAIN;
+                    }
                 }
             }
         }
@@ -613,7 +630,7 @@ APR_DECLARE(apr_status_t) apr_file_gets(char *str, int len, apr_file_t *thefile)
     if ((thefile->flags & APR_FOPEN_XTHREAD) && !thefile->pOverlapped) {
         thefile->pOverlapped = (OVERLAPPED*) apr_pcalloc(thefile->pool,
                                                          sizeof(OVERLAPPED));
-        thefile->pOverlapped->hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+        thefile->pOverlapped->hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
         if (!thefile->pOverlapped->hEvent) {
             rv = apr_get_os_error();
             return rv;

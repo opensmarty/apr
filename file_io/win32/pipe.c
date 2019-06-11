@@ -120,6 +120,7 @@ static apr_status_t file_pipe_create(apr_file_t **in,
     (void) apr_pollset_create(&(*out)->pollset, 1, p, 0);
 #endif
     if (apr_os_level >= APR_WIN_NT) {
+        apr_status_t rv;
         char rand[8];
         int pid = getpid();
 #define FMT_PIPE_NAME "\\\\.\\pipe\\apr-pipe-%x.%lx."
@@ -145,12 +146,17 @@ static apr_status_t file_pipe_create(apr_file_t **in,
             dwOpenMode |= FILE_FLAG_OVERLAPPED;
             (*in)->pOverlapped =
                     (OVERLAPPED*) apr_pcalloc((*in)->pool, sizeof(OVERLAPPED));
-            (*in)->pOverlapped->hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+            (*in)->pOverlapped->hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
             (*in)->timeout = 0;
         }
         dwPipeMode = 0;
 
-        apr_generate_random_bytes(rand, sizeof rand);
+        rv = apr_generate_random_bytes(rand, sizeof rand);
+        if (rv != APR_SUCCESS) {
+            file_cleanup(*in);
+            return rv;
+        }
+
         pos = apr_snprintf(name, sizeof name, FMT_PIPE_NAME, pid, id++);
         apr_escape_hex(name + pos, rand, sizeof rand, 0, NULL);
 
@@ -163,7 +169,7 @@ static apr_status_t file_pipe_create(apr_file_t **in,
                                           1,            /* nDefaultTimeOut, */
                                           &sa);
         if ((*in)->filehand == INVALID_HANDLE_VALUE) {
-            apr_status_t rv = apr_get_os_error();
+            rv = apr_get_os_error();
             file_cleanup(*in);
             return rv;
         }
@@ -175,7 +181,7 @@ static apr_status_t file_pipe_create(apr_file_t **in,
             dwOpenMode |= FILE_FLAG_OVERLAPPED;
             (*out)->pOverlapped =
                     (OVERLAPPED*) apr_pcalloc((*out)->pool, sizeof(OVERLAPPED));
-            (*out)->pOverlapped->hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+            (*out)->pOverlapped->hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
             (*out)->timeout = 0;
         }
 

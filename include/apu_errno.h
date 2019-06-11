@@ -24,6 +24,7 @@
 
 #include "apr.h"
 #include "apr_errno.h"
+#include "apr_pools.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,6 +52,7 @@ extern "C" {
  * APR_ENOENGINE      The engine provided was not recognised
  * APR_EINITENGINE    The engine could not be initialised
  * APR_EREINIT        Underlying crypto has already been initialised
+ * APR_ENOVERIFY      The signature verification failed
  * </PRE>
  *
  * <PRE>
@@ -83,6 +85,8 @@ extern "C" {
 #define APR_EINITENGINE      (APR_UTIL_START_STATUS + 11)
 /** @see APR_STATUS_IS_EREINIT */
 #define APR_EREINIT          (APR_UTIL_START_STATUS + 12)
+/** @see APR_STATUS_IS_ENOVERIFY */
+#define APR_ENOVERIFY        (APR_UTIL_START_STATUS + 13)
 /** @} */
 
 /**
@@ -151,6 +155,10 @@ extern "C" {
  * Crypto has already been initialised
  */
 #define APR_STATUS_IS_EREINIT(s)        ((s) == APR_EREINIT)
+/**
+ * The signature verification failed
+ */
+#define APR_STATUS_IS_ENOVERIFY(s)        ((s) == APR_ENOVERIFY)
 /** @} */
 
 /**
@@ -163,6 +171,27 @@ typedef struct apu_err_t {
     const char *msg;
     int rc;
 } apu_err_t;
+
+/**
+ * Populate a apu_err_t structure with the given error, allocated
+ * from the given pool.
+ *
+ * If the result parameter points at a NULL pointer, a apu_err_t
+ * structure will be allocated, otherwise the apu_err_t structure
+ * will be reused.
+ * @param result If NULL, the apu_err_t structure is allocated and
+ *   returned, otherwise the existing apu_err_t is used.
+ * @param p The pool to use.
+ * @param reason The reason string, may be NULL.
+ * @param rc The underlying result code.
+ * @param fmt The format of the string
+ * @param ... The arguments to use while printing the data
+ * @return The apu_err_t structure on success, NULL if out of memory.
+ */
+APR_DECLARE_NONSTD(apu_err_t *) apr_errprintf(apu_err_t *result,
+        apr_pool_t *p, const char *reason, int rc, const char *fmt, ...)
+        __attribute__((format(printf,5,6)))
+        __attribute__((nonnull(2)));
 
 /** @} */
 

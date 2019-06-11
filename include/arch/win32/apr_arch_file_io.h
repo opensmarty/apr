@@ -135,7 +135,8 @@ void *res_name_from_filename(const char *file, int global, apr_pool_t *pool);
 
 /* Private function for apr_stat/lstat/getfileinfo/dir_read */
 int fillin_fileinfo(apr_finfo_t *finfo, WIN32_FILE_ATTRIBUTE_DATA *wininfo, 
-                    int byhandle, apr_int32_t wanted);
+                    int byhandle, int finddata, const char *fname,
+                    apr_int32_t wanted);
 
 /* Private function that extends apr_stat/lstat/getfileinfo/dir_read */
 apr_status_t more_finfo(apr_finfo_t *finfo, const void *ufile, 
@@ -198,18 +199,7 @@ struct apr_dir_t {
     apr_size_t rootlen;
     char *dirname;
     char *name;
-    union {
-#if APR_HAS_UNICODE_FS
-        struct {
-            WIN32_FIND_DATAW *entry;
-        } w;
-#endif
-#if APR_HAS_ANSI_FS
-        struct {
-            WIN32_FIND_DATAA *entry;
-        } n;
-#endif        
-    };
+    WIN32_FIND_DATAW *entry;
     int bof;
 };
 

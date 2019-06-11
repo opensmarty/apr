@@ -27,6 +27,16 @@ extern "C" {
 
 #if APU_HAVE_CRYPTO
 
+/**
+ * Structure representing the streaming context for the CPRNG.
+ */
+typedef struct cprng_stream_ctx_t cprng_stream_ctx_t;
+
+/**
+ * Key size for the CPRNG.
+ */
+#define CPRNG_KEY_SIZE 32
+
 struct apr_crypto_driver_t {
 
     /** name */
@@ -56,6 +66,17 @@ struct apr_crypto_driver_t {
      */
     apr_status_t (*make)(apr_crypto_t **f, const apr_crypto_driver_t *provider,
             const char *params, apr_pool_t *pool);
+
+    /**
+     * @brief Get a hash table of key digests, keyed by the name of the digest against
+     * a pointer to apr_crypto_block_key_digest_t.
+     *
+     * @param digests - hashtable of key digests keyed to constants.
+     * @param f - encryption context
+     * @return APR_SUCCESS for success
+     */
+    apr_status_t (*get_block_key_digests)(apr_hash_t **types,
+            const apr_crypto_t *f);
 
     /**
      * @brief Get a hash table of key types, keyed by the name of the type against
@@ -237,12 +258,78 @@ struct apr_crypto_driver_t {
             apr_size_t *outlen, apr_crypto_block_t *ctx);
 
     /**
+     * @brief Initialise a context for signing or verifying arbitrary data using the
+     *        given key.
+     * @note If *d is NULL, a apr_crypto_digest_t will be created from a pool. If
+     *       *d is not NULL, *d must point at a previously created structure.
+     * @param d The digest context returned, see note.
+     * @param key The key structure to use.
+     * @param rec The digest record.
+     * @param p The pool to use.
+     * @return APR_ENOIV if an initialisation vector is required but not specified.
+     * @return APR_EINIT if the backend failed to initialise the context.
+     * @return APR_ENOTIMPL if not implemented.
+     * @return APR_ENOKEY if the key type does not support the given operation.
+     */
+    apr_status_t (*digest_init)(apr_crypto_digest_t **d,
+            const apr_crypto_key_t *key, apr_crypto_digest_rec_t *rec, apr_pool_t *p);
+
+    /**
+     * @brief Update the digest with data provided by in.
+     * @param in Address of the buffer to read.
+     * @param inlen Length of the buffer to read.
+     * @param digest The digest context to use.
+     * @return APR_ECRYPT if an error occurred.
+     * @return APR_ENOTIMPL if not implemented.
+     * @return APR_ENOKEY if the key type does not support the given operation.
+     */
+    apr_status_t (*digest_update)(apr_crypto_digest_t *digest,
+            const unsigned char *in, apr_size_t inlen);
+
+    /**
+     * @brief Finalise the digest and write the result.
+     * @note After this call, the context is cleaned and can be reused by
+     *   apr_crypto_digest_init().
+     * @param digest The digest context to use.
+     * @return APR_ECRYPT if an error occurred.
+     * @return APR_EPADDING if padding was enabled and the block was incorrectly
+     *         formatted.
+     * @return APR_ENOTIMPL if not implemented.
+     * @return APR_ENOKEY if the key type does not support the given operation.
+     */
+    apr_status_t (*digest_final)(apr_crypto_digest_t *digest);
+
+    /**
+     * @brief One shot digest on a single memory buffer.
+     * @param key The key structure to use.
+     * @param rec The digest record.
+     * @param in Address of the buffer to digest.
+     * @param inlen Length of the buffer to digest.
+     * @param p The pool to use.
+     * @return APR_ENOIV if an initialisation vector is required but not specified.
+     * @return APR_EINIT if the backend failed to initialise the context.
+     * @return APR_ENOTIMPL if not implemented.
+     * @return APR_ENOKEY if the key type does not support the given operation.
+     */
+    apr_status_t (*digest)(const apr_crypto_key_t *key,
+            apr_crypto_digest_rec_t *rec, const unsigned char *in,
+            apr_size_t inlen, apr_pool_t *p);
+
+    /**
      * @brief Clean encryption / decryption context.
      * @note After cleanup, a context is free to be reused if necessary.
      * @param ctx The block context to use.
      * @return Returns APR_ENOTIMPL if not supported.
      */
     apr_status_t (*block_cleanup)(apr_crypto_block_t *ctx);
+
+    /**
+     * @brief Clean sign / verify context.
+     * @note After cleanup, a context is free to be reused if necessary.
+     * @param ctx The digest context to use.
+     * @return Returns APR_ENOTIMPL if not supported.
+     */
+    apr_status_t (*digest_cleanup)(apr_crypto_digest_t *ctx);
 
     /**
      * @brief Clean encryption / decryption context.
@@ -286,7 +373,92 @@ struct apr_crypto_driver_t {
     apr_status_t (*key)(apr_crypto_key_t **key, const apr_crypto_key_rec_t *rec,
             const apr_crypto_t *f, apr_pool_t *p);
 
+    /**
+     * @brief Create the context for encrypting the CPRNG stream.
+     * @param pctx The pointer where the context will be returned.
+     * @param f The crypto context to use.
+     * @param cipher The cipher to use.
+     * @param pool The pool to use.
+     */
+    apr_status_t (*cprng_stream_ctx_make)(cprng_stream_ctx_t **pctx, apr_crypto_t *f,
+            apr_crypto_cipher_e cipher, apr_pool_t *pool);
+
+    /**
+     * @brief Free the context for encrypting the CPRNG stream.
+     * @param ctx The context to free.
+     */
+    void (*cprng_stream_ctx_free)(cprng_stream_ctx_t *ctx);
+
+    /**
+     * @brief Return further encrypted bytes, rekeying as necessary.
+     * @param pctx The context.
+     * @param key The key to use while rekeying.
+     * @param to Encrypted bytes are written here.
+     * @param n Length of encrypted bytes.
+     * @param z The IV to use.
+     */
+    apr_status_t (*cprng_stream_ctx_bytes)(cprng_stream_ctx_t **pctx, unsigned char *key,
+            unsigned char *to, apr_size_t n, const unsigned char *z);
+
 };
+
+#if APU_HAVE_OPENSSL
+#include <openssl/crypto.h>
+
+#ifndef APR_USE_OPENSSL_PRE_1_1_API
+#if defined(LIBRESSL_VERSION_NUMBER)
+/* LibreSSL declares OPENSSL_VERSION_NUMBER == 2.0 but does not necessarily
+ * include changes from OpenSSL >= 1.1 (new functions, macros, * deprecations,
+ * ...), so we have to work around this...
+ */
+#define APR_USE_OPENSSL_PRE_1_0_API     (0)
+#define APR_USE_OPENSSL_PRE_1_1_API     (LIBRESSL_VERSION_NUMBER < 0x2070000f)
+#define APR_USE_OPENSSL_PRE_1_1_1_API   (1)
+#else  /* defined(LIBRESSL_VERSION_NUMBER) */
+#define APR_USE_OPENSSL_PRE_1_0_API     (OPENSSL_VERSION_NUMBER < 0x10000000L)
+#define APR_USE_OPENSSL_PRE_1_1_API     (OPENSSL_VERSION_NUMBER < 0x10100000L)
+#define APR_USE_OPENSSL_PRE_1_1_1_API   (OPENSSL_VERSION_NUMBER < 0x10101000L)
+#endif /* defined(LIBRESSL_VERSION_NUMBER) */
+#endif /* ndef APR_USE_OPENSSL_PRE_1_1_API */
+
+const char *apr__crypto_openssl_version(void);
+apr_status_t apr__crypto_openssl_init(const char *params,
+                                      const apu_err_t **result,
+                                      apr_pool_t *pool);
+apr_status_t apr__crypto_openssl_term(void);
+#endif
+
+#if APU_HAVE_NSS
+const char *apr__crypto_nss_version(void);
+apr_status_t apr__crypto_nss_init(const char *params,
+                                  const apu_err_t **result,
+                                  apr_pool_t *pool);
+apr_status_t apr__crypto_nss_term(void);
+#endif
+
+#if APU_HAVE_COMMONCRYPTO
+const char *apr__crypto_commoncrypto_version(void);
+apr_status_t apr__crypto_commoncrypto_init(const char *params,
+                                           const apu_err_t **result,
+                                           apr_pool_t *pool);
+apr_status_t apr__crypto_commoncrypto_term(void);
+#endif
+
+#if APU_HAVE_MSCAPI
+const char *apr__crypto_mscapi_version(void);
+apr_status_t apr__crypto_mscapi_init(const char *params,
+                                     const apu_err_t **result,
+                                     apr_pool_t *pool);
+apr_status_t apr__crypto_mscapi_term(void);
+#endif
+
+#if APU_HAVE_MSCNG
+const char *apr__crypto_mscng_version(void);
+apr_status_t apr__crypto_mscng_init(const char *params,
+                                    const apu_err_t **result,
+                                    apr_pool_t *pool);
+apr_status_t apr__crypto_mscng_term(void);
+#endif
 
 #endif
 

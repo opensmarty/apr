@@ -48,35 +48,21 @@ APR_DECLARE(apr_status_t) apr_thread_mutex_create(apr_thread_mutex_t **mutex,
     (*mutex)->pool = pool;
 
     if (flags & APR_THREAD_MUTEX_UNNESTED) {
-        /* Use an auto-reset signaled event, ready to accept one
-         * waiting thread.
+        /* Use semaphore for unnested mutex.
          */
-        (*mutex)->type = thread_mutex_unnested_event;
-        (*mutex)->handle = CreateEvent(NULL, FALSE, TRUE, NULL);
+        (*mutex)->type = thread_mutex_unnested_semaphore;
+        (*mutex)->handle = CreateSemaphore(NULL, 1, 1, NULL);
     }
     else if (flags & APR_THREAD_MUTEX_TIMED) {
         (*mutex)->type = thread_mutex_nested_mutex;
         (*mutex)->handle = CreateMutex(NULL, FALSE, NULL);
     }
     else {
-#if APR_HAS_UNICODE_FS
         /* Critical Sections are terrific, performance-wise, on NT.
-         * On Win9x, we cannot 'try' on a critical section, so we 
-         * use a [slower] mutex object, instead.
          */
-        IF_WIN_OS_IS_UNICODE {
-            InitializeCriticalSection(&(*mutex)->section);
-            (*mutex)->type = thread_mutex_critical_section;
-            (*mutex)->handle = NULL;
-        }
-#endif
-#if APR_HAS_ANSI_FS
-        ELSE_WIN_OS_IS_ANSI {
-            (*mutex)->type = thread_mutex_nested_mutex;
-            (*mutex)->handle = CreateMutex(NULL, FALSE, NULL);
-
-        }
-#endif
+        InitializeCriticalSection(&(*mutex)->section);
+        (*mutex)->type = thread_mutex_critical_section;
+        (*mutex)->handle = NULL;
     }
 
     apr_pool_cleanup_register((*mutex)->pool, (*mutex), thread_mutex_cleanup,
@@ -118,26 +104,9 @@ APR_DECLARE(apr_status_t) apr_thread_mutex_timedlock(apr_thread_mutex_t *mutex,
                                                  apr_interval_time_t timeout)
 {
     if (mutex->type != thread_mutex_critical_section) {
-        DWORD rv, timeout_ms = 0;
-        apr_interval_time_t t = timeout;
+        DWORD rv;
 
-        do {
-            if (t > 0) {
-                /* Given timeout is 64bit usecs whereas Windows timeouts are
-                 * 32bit msecs and below INFINITE (2^32 - 1), so we may need
-                 * multiple timed out waits...
-                 */
-                if (t > apr_time_from_msec(INFINITE - 1)) {
-                    timeout_ms = INFINITE - 1;
-                    t -= apr_time_from_msec(INFINITE - 1);
-                }
-                else {
-                    timeout_ms = (DWORD)apr_time_as_msec(t);
-                    t = 0;
-                }
-            }
-            rv = WaitForSingleObject(mutex->handle, timeout_ms);
-        } while (rv == WAIT_TIMEOUT && t > 0);
+        rv = apr_wait_for_single_object(mutex->handle, timeout);
 
         if ((rv != WAIT_OBJECT_0) && (rv != WAIT_ABANDONED)) {
             return (rv == WAIT_TIMEOUT) ? APR_TIMEUP : apr_get_os_error();
@@ -153,8 +122,8 @@ APR_DECLARE(apr_status_t) apr_thread_mutex_unlock(apr_thread_mutex_t *mutex)
     if (mutex->type == thread_mutex_critical_section) {
         LeaveCriticalSection(&mutex->section);
     }
-    else if (mutex->type == thread_mutex_unnested_event) {
-        if (!SetEvent(mutex->handle)) {
+    else if (mutex->type == thread_mutex_unnested_semaphore) {
+        if (!ReleaseSemaphore(mutex->handle, 1, NULL)) {
             return apr_get_os_error();
         }
     }

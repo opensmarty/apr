@@ -48,7 +48,7 @@ static int warrsztoastr(const char * const * *retarr,
     char **env;
     char *pstrs;
     char *strs;
-    int arg;
+    int arg, args;
 
     for (args = 1, wch = arrsz; wch[0] || wch[1]; ++wch)
         if (!*wch)
@@ -127,7 +127,7 @@ APR_DECLARE(apr_status_t) apr_app_initialize(int *argc,
             wstrs = CommandLineToArgvW(sysstr, &wstrc);
             if (wstrs) {
                 *argc = apr_wastrtoastr(argv, wstrs, wstrc);
-                GlobalFree(wstrs);
+                LocalFree(wstrs);
             }
         }
 

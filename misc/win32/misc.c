@@ -138,31 +138,116 @@ apr_status_t apr_get_oslevel(apr_oslevel_e *level)
  * missing from one or more releases of the Win32 API
  */
 
-static const char* const lateDllName[DLL_defined] = {
-    "kernel32", "advapi32", "mswsock",  "ws2_32", "shell32", "ntdll.dll"  };
-static HMODULE lateDllHandle[DLL_defined] = {
-     NULL,       NULL,       NULL,       NULL,     NULL,       NULL       };
+typedef struct win32_late_dll_t {
+    INIT_ONCE control;
+    const apr_wchar_t *dll_name;
+    HMODULE dll_handle;
+} win32_late_dll_t;
+
+static win32_late_dll_t late_dll[DLL_defined] = {
+    {INIT_ONCE_STATIC_INIT, L"kernel32", NULL},
+    {INIT_ONCE_STATIC_INIT, L"advapi32", NULL},
+    {INIT_ONCE_STATIC_INIT, L"mswsock", NULL},
+    {INIT_ONCE_STATIC_INIT, L"ws2_32", NULL},
+    {INIT_ONCE_STATIC_INIT, L"shell32", NULL},
+    {INIT_ONCE_STATIC_INIT, L"ntdll.dll", NULL},
+    {INIT_ONCE_STATIC_INIT, L"Iphplapi", NULL}
+};
+
+static BOOL WINAPI load_dll_callback(PINIT_ONCE InitOnce,
+                                     PVOID Parameter,
+                                     PVOID *Context)
+{
+    win32_late_dll_t *dll = Parameter;
+
+    dll->dll_handle = LoadLibraryW(dll->dll_name);
+
+    return TRUE;
+}
 
 FARPROC apr_load_dll_func(apr_dlltoken_e fnLib, char* fnName, int ordinal)
 {
-    if (!lateDllHandle[fnLib]) { 
-        lateDllHandle[fnLib] = LoadLibraryA(lateDllName[fnLib]);
-        if (!lateDllHandle[fnLib])
-            return NULL;
-    }
+    win32_late_dll_t *dll = &late_dll[fnLib];
+
+    InitOnceExecuteOnce(&dll->control, load_dll_callback, dll, NULL);
+    if (!dll->dll_handle)
+        return NULL;
+
 #if defined(_WIN32_WCE)
     if (ordinal)
-        return GetProcAddressA(lateDllHandle[fnLib], (const char *)
-                                                     (apr_ssize_t)ordinal);
+        return GetProcAddressA(dll->dll_handle,
+                               (const char *) (apr_ssize_t)ordinal);
     else
-        return GetProcAddressA(lateDllHandle[fnLib], fnName);
+        return GetProcAddressA(dll->dll_handle, fnName);
 #else
     if (ordinal)
-        return GetProcAddress(lateDllHandle[fnLib], (const char *)
-                                                    (apr_ssize_t)ordinal);
+        return GetProcAddress(dll->dll_handle,
+                              (const char *) (apr_ssize_t)ordinal);
     else
-        return GetProcAddress(lateDllHandle[fnLib], fnName);
+        return GetProcAddress(dll->dll_handle, fnName);
 #endif
+}
+
+DWORD apr_wait_for_single_object(HANDLE handle, apr_interval_time_t timeout)
+{
+    if (APR_HAVE_LATE_DLL_FUNC(NtWaitForSingleObject)){
+        LONG ntstatus;
+
+        if (timeout < 0) {
+            ntstatus = apr_winapi_NtWaitForSingleObject(handle, FALSE, NULL);
+        }
+        else {
+            LARGE_INTEGER timeout_100ns;
+
+            /* Negative timeout means relative time. In 100 nanoseconds. */
+            timeout_100ns.QuadPart = -timeout * 10;
+            ntstatus = apr_winapi_NtWaitForSingleObject(handle, FALSE,
+                                                        &timeout_100ns);
+        }
+
+        switch(ntstatus)
+        {
+        case STATUS_WAIT_0:
+            return WAIT_OBJECT_0;
+        case STATUS_ABANDONED_WAIT_0:
+            return WAIT_ABANDONED_0;
+        case STATUS_TIMEOUT:
+            return WAIT_TIMEOUT;
+        case STATUS_USER_APC:
+            return WAIT_IO_COMPLETION;
+        default:
+            SetLastError(ERROR_INVALID_HANDLE);
+            return WAIT_FAILED;
+        }
+    }
+    else {
+        apr_interval_time_t t = timeout;
+        DWORD res;
+        DWORD timeout_ms = 0;
+
+        do {
+            if (t < 0) {
+                timeout_ms = INFINITE;
+            }
+            else if (t > 0) {
+                /* Given timeout is 64bit usecs whereas Windows timeouts are
+                 * 32bit msecs and below INFINITE (2^32 - 1), so we may need
+                 * multiple timed out waits...
+                 */
+                if (t > apr_time_from_msec(INFINITE - 1)) {
+                    timeout_ms = INFINITE - 1;
+                    t -= apr_time_from_msec(INFINITE - 1);
+                }
+                else {
+                    timeout_ms = (DWORD)apr_time_as_msec(t);
+                    t = 0;
+                }
+            }
+            res = WaitForSingleObject(handle, timeout_ms);
+        } while (res == WAIT_TIMEOUT && t > 0);
+
+        return res;
+    }
 }
 
 /* Declared in include/arch/win32/apr_dbg_win32_handles.h

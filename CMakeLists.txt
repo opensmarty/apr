@@ -24,17 +24,28 @@ FIND_PACKAGE(Expat)
 FIND_PACKAGE(LibXml2)
 FIND_PACKAGE(OpenSSL)
 
-IF(NOT EXPAT_FOUND AND NOT LIBXML2_FOUND)
-  MESSAGE(FATAL_ERROR "Either Expat or LibXml2 is required, but neither was found")
+IF(NOT APU_USE_EXPAT AND NOT APU_USE_LIBXML2 AND NOT APU_USE_XMLLITE)
+  IF(EXPAT_FOUND)
+    OPTION(APU_USE_EXPAT      "Use Expat"                    ON)
+    OPTION(APU_USE_LIBXML2    "Use LibXml2"                  OFF)
+    OPTION(APU_USE_XMLLITE    "Use XmlLite"                  OFF)
+  ELSEIF(LIBXML2_FOUND)
+    OPTION(APU_USE_EXPAT      "Use Expat"                    OFF)
+    OPTION(APU_USE_LIBXML2    "Use LibXml2"                  ON)
+    OPTION(APU_USE_XMLLITE    "Use XmlLite"                  OFF)
+  ELSE()
+    OPTION(APU_USE_EXPAT      "Use Expat"                    OFF)
+    OPTION(APU_USE_LIBXML2    "Use LibXml2"                  OFF)
+    OPTION(APU_USE_XMLLITE    "Use XmlLite"                  ON)
+  ENDIF()
 ENDIF()
 
-IF(EXPAT_FOUND)
-  OPTION(APU_USE_EXPAT      "Use Expat"                    ON)
-  IF(LIBXML2_FOUND)
-    OPTION(APU_USE_LIBXML2  "Use LibXml2"                  OFF)
-  ENDIF()
-ELSE()
-  OPTION(APU_USE_LIBXML2    "Use LibXml2"                  ON)
+IF(APU_USE_EXPAT AND NOT EXPAT_FOUND)
+  MESSAGE(FATAL_ERROR "Expat not found")
+ENDIF()
+
+IF(APU_USE_LIBXML2 AND NOT LIBXML2_FOUND)
+  MESSAGE(FATAL_ERROR "LibXml2 not found")
 ENDIF()
 
 OPTION(APR_INSTALL_PRIVATE_H  "Install selected private .h files (for httpd)"  OFF)
@@ -44,15 +55,15 @@ OPTION(APR_HAVE_IPV6        "IPv6 support"                 ON)
 OPTION(INSTALL_PDB          "Install .pdb files (if generated)"  ON)
 OPTION(APR_BUILD_TESTAPR    "Build the test suite"         OFF)
 OPTION(TEST_STATIC_LIBS     "Test programs use APR static libraries instead of shared libraries?" OFF)
-SET(MIN_WINDOWS_VER             "Vista" 
+SET(MIN_WINDOWS_VER         "Windows7"
     CACHE STRING "Minimum Windows version")
 SET(LIBXML2_ICONV_INCLUDE_DIR   ""
     CACHE STRING "Directory with iconv include files for libxml2")
 SET(LIBXML2_ICONV_LIBRARIES     ""
     CACHE STRING "iconv libraries to link with for libxml2")
 
-IF(NOT APU_USE_EXPAT AND NOT APU_USE_LIBXML2)
-  MESSAGE(FATAL_ERROR "Either Expat or LibXml2 must be selected")
+IF(NOT APU_USE_EXPAT AND NOT APU_USE_LIBXML2 AND NOT APU_USE_XMLLITE)
+  MESSAGE(FATAL_ERROR "Either Expat or LibXml2 or XmlLite must be selected")
 ENDIF()
 IF(APU_USE_EXPAT AND APU_USE_LIBXML2)
   MESSAGE(FATAL_ERROR "Only one of Expat and LibXml2 can be selected")
@@ -70,6 +81,7 @@ SET(apr_have_ipv6_10 0)
 SET(apu_have_crypto_10 0)
 SET(apu_use_libxml2_10 0)
 SET(apu_use_expat_10 0)
+SET(apu_use_xmllite_10 0)
 
 IF(APR_HAVE_IPV6)
   SET(apr_have_ipv6_10 1)
@@ -81,14 +93,16 @@ ENDIF()
 
 IF(APU_USE_EXPAT)
   SET(apu_use_expat_10 1)
-ELSE()
+ELSEIF(APU_USE_LIBXML2)
   SET(apu_use_libxml2_10 1)
+ELSE(APU_USE_XMLLITE)
+  SET(apu_use_xmllite_10 1)
 ENDIF()
 
 IF("${MIN_WINDOWS_VER}" STREQUAL "")
-  SET(win32_winnt_str "0x0600")
+  SET(win32_winnt_str "0x0601")
 ELSEIF(${MIN_WINDOWS_VER} STREQUAL "Vista")
-  SET(win32_winnt_str "0x0600")
+  MESSAGE(FATAL_ERROR "Minimum supported Windows version is Windows 7/Windows Server 2008 R2")
 ELSEIF(${MIN_WINDOWS_VER} STREQUAL "Windows7")
   SET(win32_winnt_str "0x0601")
 ELSE()
@@ -121,9 +135,12 @@ ADD_CUSTOM_TARGET(
 IF(APU_USE_EXPAT)
   SET(XMLLIB_INCLUDE_DIR ${EXPAT_INCLUDE_DIRS})
   SET(XMLLIB_LIBRARIES   ${EXPAT_LIBRARIES})
-ELSE()
+ELSEIF(APU_USE_LIBXML2)
   SET(XMLLIB_INCLUDE_DIR "${LIBXML2_INCLUDE_DIR};${LIBXML2_ICONV_INCLUDE_DIR}")
   SET(XMLLIB_LIBRARIES   "${LIBXML2_LIBRARIES};${LIBXML2_ICONV_LIBRARIES}")
+ELSEIF(APU_USE_XMLLITE)
+  SET(XMLLIB_INCLUDE_DIR "")
+  SET(XMLLIB_LIBRARIES   "xmllite.lib")
 ENDIF()
 
 # Generated .h files are stored in PROJECT_BINARY_DIR, not the
@@ -145,6 +162,7 @@ SET(APR_SYSTEM_LIBS
   ws2_32
   mswsock
   rpcrt4
+  bcrypt
 )
 
 INCLUDE_DIRECTORIES(${APR_INCLUDE_DIRECTORIES} ${XMLLIB_INCLUDE_DIR})
@@ -225,6 +243,7 @@ SET(APR_PUBLIC_HEADERS_GENERATED
 
 SET(APR_SOURCES
   atomic/win32/apr_atomic.c
+  atomic/win32/apr_atomic64.c
   buckets/apr_brigade.c
   buckets/apr_buckets.c
   buckets/apr_buckets_alloc.c
@@ -239,6 +258,8 @@ SET(APR_SOURCES
   buckets/apr_buckets_simple.c
   buckets/apr_buckets_socket.c
   crypto/apr_crypto.c
+  crypto/apr_crypto_prng.c
+  crypto/apr_crypto_internal.c
   crypto/apr_md4.c
   crypto/apr_md5.c
   crypto/apr_passwd.c
@@ -256,6 +277,7 @@ SET(APR_SOURCES
   dbm/sdbm/sdbm_pair.c
   dso/win32/dso.c
   encoding/apr_base64.c
+  encoding/apr_encode.c
   encoding/apr_escape.c
   file_io/unix/copy.c
   file_io/unix/fileacc.c
@@ -274,6 +296,12 @@ SET(APR_SOURCES
   file_io/win32/pipe.c
   file_io/win32/readwrite.c
   file_io/win32/seek.c
+  jose/apr_jose.c
+  jose/apr_jose_decode.c
+  jose/apr_jose_encode.c
+  json/apr_json.c
+  json/apr_json_decode.c
+  json/apr_json_encode.c
   hooks/apr_hooks.c
   locks/win32/proc_mutex.c
   locks/win32/thread_cond.c
@@ -334,6 +362,7 @@ SET(APR_SOURCES
   user/win32/groupinfo.c
   user/win32/userinfo.c
   util-misc/apr_date.c
+  util-misc/apr_error.c
   util-misc/apr_queue.c
   util-misc/apr_reslist.c
   util-misc/apr_rmm.c
@@ -343,6 +372,7 @@ SET(APR_SOURCES
   xml/apr_xml.c
   xml/apr_xml_expat.c
   xml/apr_xml_libxml2.c
+  xml/apr_xml_xmllite.c
 )
 
 SET(APR_TEST_SOURCES
@@ -360,6 +390,7 @@ SET(APR_TEST_SOURCES
   test/testdso.c
   test/testdup.c
   test/testenv.c
+  test/testencode.c
   test/testescape.c
   test/testfile.c
   test/testfilecopy.c
@@ -370,6 +401,8 @@ SET(APR_TEST_SOURCES
   test/testglobalmutex.c
   test/testhash.c
   test/testhooks.c
+  test/testjson.c
+  test/testjose.c
   test/testipsub.c
   test/testlfs.c
   test/testlfsabi.c
@@ -466,7 +499,7 @@ IF(APU_HAVE_ODBC)
   SET(dbd_drivers ${dbd_drivers} odbc)
   TARGET_LINK_LIBRARIES(apr_dbd_odbc-2 libapr-2 ${APR_SYSTEM_LIBS} odbc32 odbccp32)
   SET_PROPERTY(TARGET apr_dbd_odbc-2 APPEND PROPERTY LINK_FLAGS /export:apr_dbd_odbc_driver)
-  SET_TARGET_PROPERTIES(apr_dbd_odbc-2 PROPERTIES COMPILE_DEFINITIONS "APU_HAVE_ODBC;HAVE_SQL_H;APR_DECLARE_EXPORT;APU_DSO_MODULE_BUILD")
+  SET_TARGET_PROPERTIES(apr_dbd_odbc-2 PROPERTIES COMPILE_DEFINITIONS "APU_HAVE_ODBC;HAVE_SQL_H;APU_DSO_MODULE_BUILD")
   SET_TARGET_PROPERTIES(apr_dbd_odbc-2 PROPERTIES COMPILE_FLAGS "-DDLL_NAME=apr_dbd_odbc")
 ENDIF()
 
@@ -620,6 +653,7 @@ MESSAGE(STATUS "  IPv6 ............................ : ${APR_HAVE_IPV6}")
 MESSAGE(STATUS "  DBD ODBC driver ................. : ${APU_HAVE_ODBC}")
 MESSAGE(STATUS "  Use Expat ....................... : ${APU_USE_EXPAT}")
 MESSAGE(STATUS "  Use LibXml2 ..................... : ${APU_USE_LIBXML2}")
+MESSAGE(STATUS "  Use XmlLite ..................... : ${APU_USE_XMLLITE}")
 MESSAGE(STATUS "  Minimum Windows version ......... : ${MIN_WINDOWS_VER}")
 MESSAGE(STATUS "  Library files for XML ........... : ${XMLLIB_LIBRARIES}")
 MESSAGE(STATUS "  Build test suite ................ : ${APR_BUILD_TESTAPR}")

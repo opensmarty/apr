@@ -191,7 +191,7 @@
 #endif
 
 #ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0501
+#define _WIN32_WINNT 0x0601
 #endif
 
 #ifndef NOUSER
@@ -403,6 +403,11 @@ typedef  apr_uint64_t      apr_ino_t;
 #define APR_SIZEOF_VOIDP   8
 #else
 #define APR_SIZEOF_VOIDP   4
+#endif
+#if APR_HAS_LARGE_FILES
+#define APR_SIZEOF_OFF_T   8
+#else
+#define APR_SIZEOF_OFF_T   4
 #endif
 
 #if APR_SIZEOF_VOIDP == 8
@@ -678,8 +683,9 @@ typedef int apr_wait_t;
 #define APU_HAVE_ICONV          0
 #define APR_HAS_XLATE           (APU_HAVE_ICONV)
 
-#define APU_USE_EXPAT           1
+#define APU_USE_EXPAT           0
 #define APU_USE_LIBXML2         0
+#define APU_USE_XMLLITE         1
 
 /** @} */
 

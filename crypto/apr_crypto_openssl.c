@@ -34,20 +34,10 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/engine.h>
+#include <openssl/crypto.h>
+#include <openssl/obj_mac.h> /* for NID_* */
 
 #define LOG_PREFIX "apr_crypto_openssl: "
-
-#ifndef APR_USE_OPENSSL_PRE_1_1_API
-#if defined(LIBRESSL_VERSION_NUMBER)
-/* LibreSSL declares OPENSSL_VERSION_NUMBER == 2.0 but does not include most
- * changes from OpenSSL >= 1.1 (new functions, macros, deprecations, ...), so
- * we have to work around this...
- */
-#define APR_USE_OPENSSL_PRE_1_1_API (1)
-#else
-#define APR_USE_OPENSSL_PRE_1_1_API (OPENSSL_VERSION_NUMBER < 0x10100000L)
-#endif
-#endif
 
 struct apr_crypto_t {
     apr_pool_t *pool;
@@ -56,6 +46,7 @@ struct apr_crypto_t {
     apr_crypto_config_t *config;
     apr_hash_t *types;
     apr_hash_t *modes;
+    apr_hash_t *digests;
 };
 
 struct apr_crypto_config_t {
@@ -66,7 +57,10 @@ struct apr_crypto_key_t {
     apr_pool_t *pool;
     const apr_crypto_driver_t *provider;
     const apr_crypto_t *f;
-    const EVP_CIPHER * cipher;
+    const apr_crypto_key_rec_t *rec;
+    const EVP_CIPHER *cipher;
+    const EVP_MD *hmac;
+    EVP_PKEY *pkey;
     unsigned char *key;
     int keyLen;
     int doPad;
@@ -77,12 +71,37 @@ struct apr_crypto_block_t {
     apr_pool_t *pool;
     const apr_crypto_driver_t *provider;
     const apr_crypto_t *f;
+    const apr_crypto_key_t *key;
     EVP_CIPHER_CTX *cipherCtx;
     int initialised;
     int ivSize;
     int blockSize;
     int doPad;
 };
+
+struct apr_crypto_digest_t {
+    apr_pool_t *pool;
+    const apr_crypto_driver_t *provider;
+    const apr_crypto_t *f;
+    const apr_crypto_key_t *key;
+    apr_crypto_digest_rec_t *rec;
+    EVP_MD_CTX *mdCtx;
+    int initialised;
+    int digestSize;
+};
+
+struct cprng_stream_ctx_t {
+    EVP_CIPHER_CTX *ctx;
+};
+
+static struct apr_crypto_block_key_digest_t key_digests[] =
+{
+{ APR_CRYPTO_DIGEST_MD5, 16, 64 },
+{ APR_CRYPTO_DIGEST_SHA1, 20, 64 },
+{ APR_CRYPTO_DIGEST_SHA224, 28, 64 },
+{ APR_CRYPTO_DIGEST_SHA256, 32, 64 },
+{ APR_CRYPTO_DIGEST_SHA384, 48, 128 },
+{ APR_CRYPTO_DIGEST_SHA512, 64, 128 } };
 
 static struct apr_crypto_block_key_type_t key_types[] =
 {
@@ -114,15 +133,7 @@ static apr_status_t crypto_error(const apu_err_t **result,
  */
 static apr_status_t crypto_shutdown(void)
 {
-    ERR_free_strings();
-    EVP_cleanup();
-    ENGINE_cleanup();
-    return APR_SUCCESS;
-}
-
-static apr_status_t crypto_shutdown_helper(void *data)
-{
-    return crypto_shutdown();
+    return apr_crypto_lib_term("openssl");
 }
 
 /**
@@ -131,21 +142,56 @@ static apr_status_t crypto_shutdown_helper(void *data)
 static apr_status_t crypto_init(apr_pool_t *pool, const char *params,
         const apu_err_t **result)
 {
-#if APR_USE_OPENSSL_PRE_1_1_API
-    (void)CRYPTO_malloc_init();
-#else
-    OPENSSL_malloc_init();
-#endif
-    ERR_load_crypto_strings();
-    /* SSL_load_error_strings(); */
-    OpenSSL_add_all_algorithms();
-    ENGINE_load_builtin_engines();
-    ENGINE_register_all_complete();
+    return apr_crypto_lib_init("openssl", params, result, pool);
+}
 
-    apr_pool_cleanup_register(pool, pool, crypto_shutdown_helper,
-            apr_pool_cleanup_null);
+#if OPENSSL_VERSION_NUMBER < 0x0090802fL
+
+/* Code taken from OpenSSL 0.9.8b, see
+ * https://github.com/openssl/openssl/commit/cf6bc84148cb15af09b292394aaf2b45f0d5af0d
+ */
+
+EVP_CIPHER_CTX *EVP_CIPHER_CTX_new(void)
+{
+     EVP_CIPHER_CTX *ctx = OPENSSL_malloc(sizeof *ctx);
+     if (ctx)
+         EVP_CIPHER_CTX_init(ctx);
+     return ctx;
+}
+
+void EVP_CIPHER_CTX_free(EVP_CIPHER_CTX *ctx)
+{
+    if (ctx) {
+        EVP_CIPHER_CTX_cleanup(ctx);
+        OPENSSL_free(ctx);
+    }
+}
+
+#endif
+
+#if APR_USE_OPENSSL_PRE_1_1_API
+#define EVP_MD_CTX_new EVP_MD_CTX_create
+#define EVP_MD_CTX_free EVP_MD_CTX_destroy
+#endif
+
+/**
+ * @brief Clean key.
+ * @param key The key to use.
+ * @return Returns APR_ENOTIMPL if not supported.
+ */
+static apr_status_t crypto_key_cleanup(apr_crypto_key_t *key)
+{
+    if (key->pkey) {
+        EVP_PKEY_free(key->pkey);
+    }
 
     return APR_SUCCESS;
+}
+
+static apr_status_t crypto_key_cleanup_helper(void *data)
+{
+    apr_crypto_key_t *key = (apr_crypto_key_t *) data;
+    return crypto_key_cleanup(key);
 }
 
 /**
@@ -158,7 +204,15 @@ static apr_status_t crypto_block_cleanup(apr_crypto_block_t *ctx)
 {
 
     if (ctx->initialised) {
-        EVP_CIPHER_CTX_free(ctx->cipherCtx);
+        if (ctx->cipherCtx) {
+#if APR_USE_OPENSSL_PRE_1_1_API
+            EVP_CIPHER_CTX_cleanup(ctx->cipherCtx);
+#else
+            EVP_CIPHER_CTX_reset(ctx->cipherCtx);
+            EVP_CIPHER_CTX_free(ctx->cipherCtx);
+#endif
+            ctx->cipherCtx = NULL;
+        }
         ctx->initialised = 0;
     }
 
@@ -170,6 +224,33 @@ static apr_status_t crypto_block_cleanup_helper(void *data)
 {
     apr_crypto_block_t *block = (apr_crypto_block_t *) data;
     return crypto_block_cleanup(block);
+}
+
+/**
+ * @brief Clean sign / verify context.
+ * @note After cleanup, a context is free to be reused if necessary.
+ * @param ctx The block context to use.
+ * @return Returns APR_ENOTIMPL if not supported.
+ */
+static apr_status_t crypto_digest_cleanup(apr_crypto_digest_t *ctx)
+{
+
+    if (ctx->initialised) {
+        if (ctx->mdCtx) {
+            EVP_MD_CTX_free(ctx->mdCtx);
+            ctx->mdCtx = NULL;
+        }
+        ctx->initialised = 0;
+    }
+
+    return APR_SUCCESS;
+
+}
+
+static apr_status_t crypto_digest_cleanup_helper(void *data)
+{
+    apr_crypto_digest_t *digest = (apr_crypto_digest_t *) data;
+    return crypto_digest_cleanup(digest);
 }
 
 /**
@@ -280,21 +361,37 @@ static apr_status_t crypto_make(apr_crypto_t **ff,
         return APR_ENOMEM;
     }
 
+    f->digests = apr_hash_make(pool);
+    if (!f->digests) {
+        return APR_ENOMEM;
+    }
+    apr_hash_set(f->digests, "md5", APR_HASH_KEY_STRING, &(key_digests[i = 0]));
+    apr_hash_set(f->digests, "sha1", APR_HASH_KEY_STRING, &(key_digests[++i]));
+    apr_hash_set(f->digests, "sha224", APR_HASH_KEY_STRING, &(key_digests[++i]));
+    apr_hash_set(f->digests, "sha256", APR_HASH_KEY_STRING, &(key_digests[++i]));
+    apr_hash_set(f->digests, "sha384", APR_HASH_KEY_STRING, &(key_digests[++i]));
+    apr_hash_set(f->digests, "sha512", APR_HASH_KEY_STRING, &(key_digests[++i]));
+
     f->types = apr_hash_make(pool);
     if (!f->types) {
         return APR_ENOMEM;
     }
-    apr_hash_set(f->types, "3des192", APR_HASH_KEY_STRING, &(key_types[0]));
-    apr_hash_set(f->types, "aes128", APR_HASH_KEY_STRING, &(key_types[1]));
-    apr_hash_set(f->types, "aes192", APR_HASH_KEY_STRING, &(key_types[2]));
-    apr_hash_set(f->types, "aes256", APR_HASH_KEY_STRING, &(key_types[3]));
+    apr_hash_set(f->types, "3des192", APR_HASH_KEY_STRING, &(key_types[i = 0]));
+    apr_hash_set(f->types, "aes128", APR_HASH_KEY_STRING, &(key_types[++i]));
+    apr_hash_set(f->types, "aes192", APR_HASH_KEY_STRING, &(key_types[++i]));
+    apr_hash_set(f->types, "aes256", APR_HASH_KEY_STRING, &(key_types[++i]));
 
     f->modes = apr_hash_make(pool);
     if (!f->modes) {
         return APR_ENOMEM;
     }
-    apr_hash_set(f->modes, "ecb", APR_HASH_KEY_STRING, &(key_modes[0]));
-    apr_hash_set(f->modes, "cbc", APR_HASH_KEY_STRING, &(key_modes[1]));
+    apr_hash_set(f->modes, "ecb", APR_HASH_KEY_STRING, &(key_modes[i = 0]));
+    apr_hash_set(f->modes, "cbc", APR_HASH_KEY_STRING, &(key_modes[++i]));
+
+    f->digests = apr_hash_make(pool);
+    if (!f->digests) {
+        return APR_ENOMEM;
+    }
 
     apr_pool_cleanup_register(pool, f, crypto_cleanup_helper,
             apr_pool_cleanup_null);
@@ -313,6 +410,21 @@ static apr_status_t crypto_make(apr_crypto_t **ff,
 
     return APR_SUCCESS;
 
+}
+
+/**
+ * @brief Get a hash table of key digests, keyed by the name of the digest against
+ * a pointer to apr_crypto_block_key_digest_t.
+ *
+ * @param digests - hashtable of key digests keyed to constants.
+ * @param f - encryption context
+ * @return APR_SUCCESS for success
+ */
+static apr_status_t crypto_get_block_key_digests(apr_hash_t **digests,
+        const apr_crypto_t *f)
+{
+    *digests = f->digests;
+    return APR_SUCCESS;
 }
 
 /**
@@ -445,18 +557,23 @@ static apr_status_t crypto_key(apr_crypto_key_t **k,
         }
     }
 
+    apr_pool_cleanup_register(p, key, crypto_key_cleanup_helper,
+            apr_pool_cleanup_null);
+
+    key->pool = p;
     key->f = f;
     key->provider = f->provider;
-
-    /* decide on what cipher mechanism we will be using */
-    rv = crypto_cipher_mechanism(key, rec->type, rec->mode, rec->pad, p);
-    if (APR_SUCCESS != rv) {
-        return rv;
-    }
+    key->rec = rec;
 
     switch (rec->ktype) {
 
     case APR_CRYPTO_KTYPE_PASSPHRASE: {
+
+        /* decide on what cipher mechanism we will be using */
+        rv = crypto_cipher_mechanism(key, rec->type, rec->mode, rec->pad, p);
+        if (APR_SUCCESS != rv) {
+            return rv;
+        }
 
         /* generate the key */
         if (PKCS5_PBKDF2_HMAC_SHA1(rec->k.passphrase.pass,
@@ -472,6 +589,12 @@ static apr_status_t crypto_key(apr_crypto_key_t **k,
 
     case APR_CRYPTO_KTYPE_SECRET: {
 
+        /* decide on what cipher mechanism we will be using */
+        rv = crypto_cipher_mechanism(key, rec->type, rec->mode, rec->pad, p);
+        if (APR_SUCCESS != rv) {
+            return rv;
+        }
+
         /* sanity check - key correct size? */
         if (rec->k.secret.secretLen != key->keyLen) {
             return APR_EKEYLENGTH;
@@ -479,6 +602,115 @@ static apr_status_t crypto_key(apr_crypto_key_t **k,
 
         /* copy the key */
         memcpy(key->key, rec->k.secret.secret, rec->k.secret.secretLen);
+
+        break;
+    }
+    case APR_CRYPTO_KTYPE_HASH: {
+
+        switch (rec->k.hash.digest) {
+        case APR_CRYPTO_DIGEST_MD5:
+            key->hmac = EVP_md5();
+            break;
+        case APR_CRYPTO_DIGEST_SHA1:
+            key->hmac = EVP_sha1();
+            break;
+        case APR_CRYPTO_DIGEST_SHA224:
+            key->hmac = EVP_sha224();
+            break;
+        case APR_CRYPTO_DIGEST_SHA256:
+            key->hmac = EVP_sha256();
+            break;
+        case APR_CRYPTO_DIGEST_SHA384:
+            key->hmac = EVP_sha384();
+            break;
+        case APR_CRYPTO_DIGEST_SHA512:
+            key->hmac = EVP_sha512();
+            break;
+        default:
+            return APR_ENODIGEST;
+        }
+
+        break;
+    }
+    case APR_CRYPTO_KTYPE_HMAC: {
+
+        apr_crypto_config_t *config = f->config;
+
+        /* create hmac key */
+        if (!(key->pkey = EVP_PKEY_new_mac_key(EVP_PKEY_HMAC, config->engine,
+                rec->k.hmac.secret, rec->k.hmac.secretLen))) {
+            return APR_ENOKEY;
+        }
+
+        switch (rec->k.hmac.digest) {
+        case APR_CRYPTO_DIGEST_MD5:
+            key->hmac = EVP_md5();
+            break;
+        case APR_CRYPTO_DIGEST_SHA1:
+            key->hmac = EVP_sha1();
+            break;
+        case APR_CRYPTO_DIGEST_SHA224:
+            key->hmac = EVP_sha224();
+            break;
+        case APR_CRYPTO_DIGEST_SHA256:
+            key->hmac = EVP_sha256();
+            break;
+        case APR_CRYPTO_DIGEST_SHA384:
+            key->hmac = EVP_sha384();
+            break;
+        case APR_CRYPTO_DIGEST_SHA512:
+            key->hmac = EVP_sha512();
+            break;
+        default:
+            return APR_ENODIGEST;
+        }
+
+        break;
+    }
+
+    case APR_CRYPTO_KTYPE_CMAC: {
+
+#if !APR_USE_OPENSSL_PRE_1_1_1_API
+        apr_crypto_config_t *config = f->config;
+
+        /* decide on what cipher mechanism we will be using */
+        rv = crypto_cipher_mechanism(key, rec->type, rec->mode, rec->pad, p);
+        if (APR_SUCCESS != rv) {
+            return rv;
+        }
+
+        /* create cmac key */
+        if (!(key->pkey = EVP_PKEY_new_CMAC_key(config->engine,
+                rec->k.cmac.secret, rec->k.cmac.secretLen, key->cipher))) {
+            return APR_ENOKEY;
+        }
+
+        switch (rec->k.hmac.digest) {
+        case APR_CRYPTO_DIGEST_MD5:
+            key->hmac = EVP_md5();
+            break;
+        case APR_CRYPTO_DIGEST_SHA1:
+            key->hmac = EVP_sha1();
+            break;
+        case APR_CRYPTO_DIGEST_SHA224:
+            key->hmac = EVP_sha224();
+            break;
+        case APR_CRYPTO_DIGEST_SHA256:
+            key->hmac = EVP_sha256();
+            break;
+        case APR_CRYPTO_DIGEST_SHA384:
+            key->hmac = EVP_sha384();
+            break;
+        case APR_CRYPTO_DIGEST_SHA512:
+            key->hmac = EVP_sha512();
+            break;
+        default:
+            return APR_ENODIGEST;
+        }
+
+#else
+        return APR_ENOTIMPL;
+#endif
 
         break;
     }
@@ -495,7 +727,7 @@ static apr_status_t crypto_key(apr_crypto_key_t **k,
     /* note: openssl incorrectly returns non zero IV size values for ECB
      * algorithms, so work around this by ignoring the IV size.
      */
-    if (APR_MODE_ECB != rec->mode) {
+    if (APR_MODE_ECB != rec->mode && key->cipher) {
         key->ivSize = EVP_CIPHER_iv_length(key->cipher);
     }
 
@@ -537,6 +769,7 @@ static apr_status_t crypto_passphrase(apr_crypto_key_t **k, apr_size_t *ivSize,
         const int iterations, const apr_crypto_t *f, apr_pool_t *p)
 {
     apr_crypto_key_t *key = *k;
+    apr_crypto_key_rec_t *rec;
     apr_status_t rv;
 
     if (!key) {
@@ -548,6 +781,11 @@ static apr_status_t crypto_passphrase(apr_crypto_key_t **k, apr_size_t *ivSize,
 
     key->f = f;
     key->provider = f->provider;
+    key->rec = rec = apr_pcalloc(p, sizeof(apr_crypto_key_rec_t));
+    if (!key->rec) {
+        return APR_ENOMEM;
+    }
+    rec->ktype = APR_CRYPTO_KTYPE_PASSPHRASE;
 
     /* decide on what cipher mechanism we will be using */
     rv = crypto_cipher_mechanism(key, type, mode, doPad, p);
@@ -608,59 +846,73 @@ static apr_status_t crypto_block_encrypt_init(apr_crypto_block_t **ctx,
     block->f = key->f;
     block->pool = p;
     block->provider = key->provider;
+    block->key = key;
 
     apr_pool_cleanup_register(p, block, crypto_block_cleanup_helper,
             apr_pool_cleanup_null);
 
-    /* create a new context for encryption */
-    if (!block->initialised) {
-        block->cipherCtx = EVP_CIPHER_CTX_new();
-        block->initialised = 1;
-    }
+    switch (key->rec->ktype) {
 
-    /* generate an IV, if necessary */
-    usedIv = NULL;
-    if (key->ivSize) {
-        if (iv == NULL) {
-            return APR_ENOIV;
+    case APR_CRYPTO_KTYPE_PASSPHRASE:
+    case APR_CRYPTO_KTYPE_SECRET: {
+
+        /* create a new context for encryption */
+        if (!block->initialised) {
+            block->cipherCtx = EVP_CIPHER_CTX_new();
+            block->initialised = 1;
         }
-        if (*iv == NULL) {
-            usedIv = apr_pcalloc(p, key->ivSize);
-            if (!usedIv) {
-                return APR_ENOMEM;
-            }
-            apr_crypto_clear(p, usedIv, key->ivSize);
-            if (!((RAND_status() == 1)
-                    && (RAND_bytes(usedIv, key->ivSize) == 1))) {
+
+        /* generate an IV, if necessary */
+        usedIv = NULL;
+        if (key->ivSize) {
+            if (iv == NULL) {
                 return APR_ENOIV;
             }
-            *iv = usedIv;
+            if (*iv == NULL) {
+                usedIv = apr_pcalloc(p, key->ivSize);
+                if (!usedIv) {
+                    return APR_ENOMEM;
+                }
+                apr_crypto_clear(p, usedIv, key->ivSize);
+                if (!((RAND_status() == 1)
+                        && (RAND_bytes(usedIv, key->ivSize) == 1))) {
+                    return APR_ENOIV;
+                }
+                *iv = usedIv;
+            }
+            else {
+                usedIv = (unsigned char *) *iv;
+            }
         }
-        else {
-            usedIv = (unsigned char *) *iv;
-        }
-    }
 
-    /* set up our encryption context */
+        /* set up our encryption context */
 #if CRYPTO_OPENSSL_CONST_BUFFERS
-    if (!EVP_EncryptInit_ex(block->cipherCtx, key->cipher, config->engine,
-            key->key, usedIv)) {
+        if (!EVP_EncryptInit_ex(block->cipherCtx, key->cipher, config->engine,
+                key->key, usedIv)) {
 #else
         if (!EVP_EncryptInit_ex(block->cipherCtx, key->cipher, config->engine, (unsigned char *) key->key, (unsigned char *) usedIv)) {
 #endif
-        return APR_EINIT;
-    }
+            return APR_EINIT;
+        }
 
-    /* Clear up any read padding */
-    if (!EVP_CIPHER_CTX_set_padding(block->cipherCtx, key->doPad)) {
-        return APR_EPADDING;
-    }
+        /* Clear up any read padding */
+        if (!EVP_CIPHER_CTX_set_padding(block->cipherCtx, key->doPad)) {
+            return APR_EPADDING;
+        }
 
-    if (blockSize) {
-        *blockSize = EVP_CIPHER_block_size(key->cipher);
-    }
+        if (blockSize) {
+            *blockSize = EVP_CIPHER_block_size(key->cipher);
+        }
 
-    return APR_SUCCESS;
+        return APR_SUCCESS;
+
+    }
+    default: {
+
+        return APR_EINVAL;
+
+    }
+    }
 
 }
 
@@ -684,43 +936,52 @@ static apr_status_t crypto_block_encrypt_init(apr_crypto_block_t **ctx,
  */
 static apr_status_t crypto_block_encrypt(unsigned char **out,
         apr_size_t *outlen, const unsigned char *in, apr_size_t inlen,
-        apr_crypto_block_t *ctx)
+        apr_crypto_block_t *block)
 {
-    int outl = *outlen;
-    unsigned char *buffer;
+    switch (block->key->rec->ktype) {
 
-    /* are we after the maximum size of the out buffer? */
-    if (!out) {
-        *outlen = inlen + EVP_MAX_BLOCK_LENGTH;
-        return APR_SUCCESS;
-    }
+    case APR_CRYPTO_KTYPE_PASSPHRASE:
+    case APR_CRYPTO_KTYPE_SECRET: {
 
-    /* must we allocate the output buffer from a pool? */
-    if (!*out) {
-        buffer = apr_palloc(ctx->pool, inlen + EVP_MAX_BLOCK_LENGTH);
-        if (!buffer) {
-            return APR_ENOMEM;
+        int outl = *outlen;
+        unsigned char *buffer;
+
+        /* are we after the maximum size of the out buffer? */
+        if (!out) {
+            *outlen = inlen + EVP_MAX_BLOCK_LENGTH;
+            return APR_SUCCESS;
         }
-        apr_crypto_clear(ctx->pool, buffer, inlen + EVP_MAX_BLOCK_LENGTH);
-        *out = buffer;
-    }
+
+        /* must we allocate the output buffer from a pool? */
+        if (!*out) {
+            buffer = apr_palloc(block->pool, inlen + EVP_MAX_BLOCK_LENGTH);
+            if (!buffer) {
+                return APR_ENOMEM;
+            }
+            apr_crypto_clear(block->pool, buffer, inlen + EVP_MAX_BLOCK_LENGTH);
+            *out = buffer;
+        }
 
 #if CRYPT_OPENSSL_CONST_BUFFERS
-    if (!EVP_EncryptUpdate(ctx->cipherCtx, (*out), &outl, in, inlen)) {
+        if (!EVP_EncryptUpdate(block->cipherCtx, (*out), &outl, in, inlen)) {
 #else
-    if (!EVP_EncryptUpdate(ctx->cipherCtx, (*out), &outl,
-            (unsigned char *) in, inlen)) {
+        if (!EVP_EncryptUpdate(block->cipherCtx, (*out), &outl,
+                (unsigned char *) in, inlen)) {
 #endif
-#if APR_USE_OPENSSL_PRE_1_1_API
-        EVP_CIPHER_CTX_cleanup(ctx->cipherCtx);
-#else
-        EVP_CIPHER_CTX_reset(ctx->cipherCtx);
-#endif
-        return APR_ECRYPT;
-    }
-    *outlen = outl;
+            crypto_block_cleanup(block);
+            return APR_ECRYPT;
+        }
+        *outlen = outl;
 
-    return APR_SUCCESS;
+        return APR_SUCCESS;
+
+    }
+    default: {
+
+        return APR_EINVAL;
+
+    }
+    }
 
 }
 
@@ -743,24 +1004,33 @@ static apr_status_t crypto_block_encrypt(unsigned char **out,
  * @return APR_ENOTIMPL if not implemented.
  */
 static apr_status_t crypto_block_encrypt_finish(unsigned char *out,
-        apr_size_t *outlen, apr_crypto_block_t *ctx)
+        apr_size_t *outlen, apr_crypto_block_t *block)
 {
-    apr_status_t rc = APR_SUCCESS;
-    int len = *outlen;
+    switch (block->key->rec->ktype) {
 
-    if (EVP_EncryptFinal_ex(ctx->cipherCtx, out, &len) == 0) {
-        rc = APR_EPADDING;
-    }
-    else {
-        *outlen = len;
-    }
-#if APR_USE_OPENSSL_PRE_1_1_API
-    EVP_CIPHER_CTX_cleanup(ctx->cipherCtx);
-#else
-    EVP_CIPHER_CTX_reset(ctx->cipherCtx);
-#endif
+    case APR_CRYPTO_KTYPE_PASSPHRASE:
+    case APR_CRYPTO_KTYPE_SECRET: {
 
-    return rc;
+        apr_status_t rc = APR_SUCCESS;
+        int len = *outlen;
+
+        if (EVP_EncryptFinal_ex(block->cipherCtx, out, &len) == 0) {
+            rc = APR_EPADDING;
+        }
+        else {
+            *outlen = len;
+        }
+        crypto_block_cleanup(block);
+
+        return rc;
+
+    }
+    default: {
+
+        return APR_EINVAL;
+
+    }
+    }
 
 }
 
@@ -794,43 +1064,57 @@ static apr_status_t crypto_block_decrypt_init(apr_crypto_block_t **ctx,
     block->f = key->f;
     block->pool = p;
     block->provider = key->provider;
+    block->key = key;
 
     apr_pool_cleanup_register(p, block, crypto_block_cleanup_helper,
             apr_pool_cleanup_null);
 
-    /* create a new context for encryption */
-    if (!block->initialised) {
-        block->cipherCtx = EVP_CIPHER_CTX_new();
-        block->initialised = 1;
-    }
+    switch (key->rec->ktype) {
 
-    /* generate an IV, if necessary */
-    if (key->ivSize) {
-        if (iv == NULL) {
-            return APR_ENOIV;
+    case APR_CRYPTO_KTYPE_PASSPHRASE:
+    case APR_CRYPTO_KTYPE_SECRET: {
+
+        /* create a new context for encryption */
+        if (!block->initialised) {
+            block->cipherCtx = EVP_CIPHER_CTX_new();
+            block->initialised = 1;
         }
-    }
 
-    /* set up our encryption context */
+        /* generate an IV, if necessary */
+        if (key->ivSize) {
+            if (iv == NULL) {
+                return APR_ENOIV;
+            }
+        }
+
+        /* set up our encryption context */
 #if CRYPTO_OPENSSL_CONST_BUFFERS
-    if (!EVP_DecryptInit_ex(block->cipherCtx, key->cipher, config->engine,
-            key->key, iv)) {
+        if (!EVP_DecryptInit_ex(block->cipherCtx, key->cipher, config->engine,
+                key->key, iv)) {
 #else
-        if (!EVP_DecryptInit_ex(block->cipherCtx, key->cipher, config->engine, (unsigned char *) key->key, (unsigned char *) iv)) {
+            if (!EVP_DecryptInit_ex(block->cipherCtx, key->cipher, config->engine, (unsigned char *) key->key, (unsigned char *) iv)) {
 #endif
-        return APR_EINIT;
-    }
+            return APR_EINIT;
+        }
 
-    /* Clear up any read padding */
-    if (!EVP_CIPHER_CTX_set_padding(block->cipherCtx, key->doPad)) {
-        return APR_EPADDING;
-    }
+        /* Clear up any read padding */
+        if (!EVP_CIPHER_CTX_set_padding(block->cipherCtx, key->doPad)) {
+            return APR_EPADDING;
+        }
 
-    if (blockSize) {
-        *blockSize = EVP_CIPHER_block_size(key->cipher);
-    }
+        if (blockSize) {
+            *blockSize = EVP_CIPHER_block_size(key->cipher);
+        }
 
-    return APR_SUCCESS;
+        return APR_SUCCESS;
+
+    }
+    default: {
+
+        return APR_EINVAL;
+
+    }
+    }
 
 }
 
@@ -854,43 +1138,53 @@ static apr_status_t crypto_block_decrypt_init(apr_crypto_block_t **ctx,
  */
 static apr_status_t crypto_block_decrypt(unsigned char **out,
         apr_size_t *outlen, const unsigned char *in, apr_size_t inlen,
-        apr_crypto_block_t *ctx)
+        apr_crypto_block_t *block)
 {
-    int outl = *outlen;
-    unsigned char *buffer;
+    switch (block->key->rec->ktype) {
 
-    /* are we after the maximum size of the out buffer? */
-    if (!out) {
-        *outlen = inlen + EVP_MAX_BLOCK_LENGTH;
-        return APR_SUCCESS;
-    }
+    case APR_CRYPTO_KTYPE_PASSPHRASE:
+    case APR_CRYPTO_KTYPE_SECRET: {
 
-    /* must we allocate the output buffer from a pool? */
-    if (!(*out)) {
-        buffer = apr_palloc(ctx->pool, inlen + EVP_MAX_BLOCK_LENGTH);
-        if (!buffer) {
-            return APR_ENOMEM;
+        int outl = *outlen;
+        unsigned char *buffer;
+
+        /* are we after the maximum size of the out buffer? */
+        if (!out) {
+            *outlen = inlen + EVP_MAX_BLOCK_LENGTH;
+            return APR_SUCCESS;
         }
-        apr_crypto_clear(ctx->pool, buffer, inlen + EVP_MAX_BLOCK_LENGTH);
-        *out = buffer;
-    }
+
+        /* must we allocate the output buffer from a pool? */
+        if (!(*out)) {
+            buffer = apr_palloc(block->pool, inlen + EVP_MAX_BLOCK_LENGTH);
+            if (!buffer) {
+                return APR_ENOMEM;
+            }
+            apr_crypto_clear(block->pool, buffer, inlen + EVP_MAX_BLOCK_LENGTH);
+            *out = buffer;
+        }
 
 #if CRYPT_OPENSSL_CONST_BUFFERS
-    if (!EVP_DecryptUpdate(ctx->cipherCtx, *out, &outl, in, inlen)) {
+        if (!EVP_DecryptUpdate(block->cipherCtx, *out, &outl, in, inlen)) {
 #else
-    if (!EVP_DecryptUpdate(ctx->cipherCtx, *out, &outl, (unsigned char *) in,
-            inlen)) {
+        if (!EVP_DecryptUpdate(block->cipherCtx, *out, &outl, (unsigned char *) in,
+                inlen)) {
 #endif
-#if APR_USE_OPENSSL_PRE_1_1_API
-        EVP_CIPHER_CTX_cleanup(ctx->cipherCtx);
-#else
-        EVP_CIPHER_CTX_reset(ctx->cipherCtx);
-#endif
-        return APR_ECRYPT;
-    }
-    *outlen = outl;
+            crypto_block_cleanup(block);
 
-    return APR_SUCCESS;
+            return APR_ECRYPT;
+        }
+        *outlen = outl;
+
+        return APR_SUCCESS;
+
+    }
+    default: {
+
+        return APR_EINVAL;
+
+    }
+    }
 
 }
 
@@ -913,38 +1207,398 @@ static apr_status_t crypto_block_decrypt(unsigned char **out,
  * @return APR_ENOTIMPL if not implemented.
  */
 static apr_status_t crypto_block_decrypt_finish(unsigned char *out,
-        apr_size_t *outlen, apr_crypto_block_t *ctx)
+        apr_size_t *outlen, apr_crypto_block_t *block)
 {
-    apr_status_t rc = APR_SUCCESS;
-    int len = *outlen;
+    switch (block->key->rec->ktype) {
 
-    if (EVP_DecryptFinal_ex(ctx->cipherCtx, out, &len) == 0) {
-        rc = APR_EPADDING;
+    case APR_CRYPTO_KTYPE_PASSPHRASE:
+    case APR_CRYPTO_KTYPE_SECRET: {
+
+        apr_status_t rc = APR_SUCCESS;
+        int len = *outlen;
+
+        if (EVP_DecryptFinal_ex(block->cipherCtx, out, &len) == 0) {
+            rc = APR_EPADDING;
+        }
+        else {
+            *outlen = len;
+        }
+        crypto_block_cleanup(block);
+
+        return rc;
+
+    }
+    default: {
+
+        return APR_EINVAL;
+
+    }
+    }
+
+}
+
+static apr_status_t crypto_digest_init(apr_crypto_digest_t **d,
+        const apr_crypto_key_t *key, apr_crypto_digest_rec_t *rec, apr_pool_t *p)
+{
+    apr_crypto_config_t *config = key->f->config;
+    apr_crypto_digest_t *digest = *d;
+    if (!digest) {
+        *d = digest = apr_pcalloc(p, sizeof(apr_crypto_digest_t));
+    }
+    if (!digest) {
+        return APR_ENOMEM;
+    }
+    digest->f = key->f;
+    digest->pool = p;
+    digest->provider = key->provider;
+    digest->key = key;
+    digest->rec = rec;
+
+    /* create a new context for digest */
+    if (!digest->initialised) {
+        digest->mdCtx = EVP_MD_CTX_new();
+        digest->initialised = 1;
+    }
+
+    apr_pool_cleanup_register(p, digest, crypto_digest_cleanup_helper,
+            apr_pool_cleanup_null);
+
+    switch (key->rec->ktype) {
+
+    case APR_CRYPTO_KTYPE_HASH: {
+
+        if (1
+                != EVP_DigestInit_ex(digest->mdCtx, key->hmac,
+                        config->engine)) {
+            return APR_EINIT;
+        }
+
+        break;
+    }
+    case APR_CRYPTO_KTYPE_HMAC:
+    case APR_CRYPTO_KTYPE_CMAC: {
+        if (1
+                != EVP_DigestSignInit(digest->mdCtx, NULL, key->hmac,
+                        config->engine, key->pkey)) {
+            return APR_EINIT;
+        }
+        break;
+    }
+    default: {
+        return APR_EINVAL;
+    }
+    }
+
+    return APR_SUCCESS;
+
+}
+
+static apr_status_t crypto_digest_update(apr_crypto_digest_t *digest,
+        const unsigned char *in, apr_size_t inlen)
+{
+    switch (digest->key->rec->ktype) {
+
+    case APR_CRYPTO_KTYPE_HASH: {
+
+        if (1 != EVP_DigestUpdate(digest->mdCtx, in, inlen)) {
+            crypto_digest_cleanup(digest);
+            return APR_ECRYPT;
+        }
+
+        return APR_SUCCESS;
+
+    }
+
+    case APR_CRYPTO_KTYPE_HMAC:
+    case APR_CRYPTO_KTYPE_CMAC: {
+
+        if (1 != EVP_DigestSignUpdate(digest->mdCtx, in, inlen)) {
+            crypto_digest_cleanup(digest);
+            return APR_ECRYPT;
+        }
+
+        return APR_SUCCESS;
+
+    }
+    default: {
+        return APR_EINVAL;
+    }
+    }
+
+}
+
+static apr_status_t crypto_digest_final(apr_crypto_digest_t *digest)
+{
+
+    switch (digest->key->rec->ktype) {
+
+    case APR_CRYPTO_KTYPE_HASH: {
+
+        apr_status_t status = APR_SUCCESS;
+
+        unsigned int len = EVP_MD_CTX_size(digest->mdCtx);
+
+        switch (digest->rec->dtype) {
+        case APR_CRYPTO_DTYPE_HASH: {
+
+            /* must we allocate the output buffer from a pool? */
+            if (!digest->rec->d.hash.s || digest->rec->d.hash.slen != len) {
+                digest->rec->d.hash.slen = len;
+                digest->rec->d.hash.s = apr_palloc(digest->pool, len);
+                if (!digest->rec->d.hash.s) {
+                    return APR_ENOMEM;
+                }
+                apr_crypto_clear(digest->pool, digest->rec->d.hash.s, len);
+            }
+
+            /* then, determine the signature */
+            if (EVP_DigestFinal_ex(digest->mdCtx, digest->rec->d.hash.s, &len)
+                    == 0) {
+                status = APR_ECRYPT;
+            }
+
+            break;
+        }
+        default:
+            status = APR_ENODIGEST;
+        }
+
+        crypto_digest_cleanup(digest);
+
+        return status;
+
+    }
+
+    case APR_CRYPTO_KTYPE_HMAC:
+    case APR_CRYPTO_KTYPE_CMAC: {
+
+        apr_status_t status = APR_SUCCESS;
+
+        size_t len;
+
+        /* first, determine the signature length */
+        if (1 != EVP_DigestSignFinal(digest->mdCtx, NULL, &len)) {
+            status = APR_ECRYPT;
+        } else {
+
+            switch (digest->rec->dtype) {
+            case APR_CRYPTO_DTYPE_SIGN: {
+
+                /* must we allocate the output buffer from a pool? */
+                if (!digest->rec->d.sign.s || digest->rec->d.sign.slen != len) {
+                    digest->rec->d.sign.slen = len;
+                    digest->rec->d.sign.s = apr_palloc(digest->pool, len);
+                    if (!digest->rec->d.sign.s) {
+                        return APR_ENOMEM;
+                    }
+                    apr_crypto_clear(digest->pool, digest->rec->d.sign.s, len);
+                }
+
+                /* then, determine the signature */
+                if (EVP_DigestSignFinal(digest->mdCtx, digest->rec->d.sign.s,
+                        &len) == 0) {
+                    status = APR_ECRYPT;
+                }
+
+                break;
+            }
+            case APR_CRYPTO_DTYPE_VERIFY: {
+
+                /* must we allocate the output buffer from a pool? */
+                if (!digest->rec->d.verify.s
+                        || digest->rec->d.verify.slen != len) {
+                    digest->rec->d.verify.slen = len;
+                    digest->rec->d.verify.s = apr_palloc(digest->pool, len);
+                    if (!digest->rec->d.verify.s) {
+                        return APR_ENOMEM;
+                    }
+                    apr_crypto_clear(digest->pool, digest->rec->d.verify.s,
+                            len);
+                }
+
+                /* then, determine the signature */
+                if (EVP_DigestSignFinal(digest->mdCtx, digest->rec->d.verify.s,
+                        &len) == 0) {
+                    status = APR_ECRYPT;
+                } else if (digest->rec->d.verify.slen
+                        == digest->rec->d.verify.vlen) {
+                    status =
+                            CRYPTO_memcmp(digest->rec->d.verify.s,
+                                    digest->rec->d.verify.v,
+                                    digest->rec->d.verify.slen) ?
+                            APR_ENOVERIFY : APR_SUCCESS;
+                } else {
+                    status = APR_ENOVERIFY;
+                }
+
+                break;
+            }
+            default:
+                status = APR_ENODIGEST;
+            }
+
+        }
+
+        crypto_digest_cleanup(digest);
+
+        return status;
+
+    }
+    default: {
+        return APR_EINVAL;
+    }
+    }
+
+}
+
+static apr_status_t crypto_digest(
+        const apr_crypto_key_t *key, apr_crypto_digest_rec_t *rec, const unsigned char *in,
+        apr_size_t inlen, apr_pool_t *p)
+{
+    apr_crypto_digest_t *digest = NULL;
+    apr_status_t status = APR_SUCCESS;
+
+    status = crypto_digest_init(&digest, key, rec, p);
+    if (APR_SUCCESS == status) {
+        status = crypto_digest_update(digest, in, inlen);
+        if (APR_SUCCESS == status) {
+            status = crypto_digest_final(digest);
+        }
+    }
+
+    return status;
+}
+
+static apr_status_t cprng_stream_ctx_make(cprng_stream_ctx_t **psctx,
+        apr_crypto_t *f, apr_crypto_cipher_e cipher, apr_pool_t *pool)
+{
+    cprng_stream_ctx_t *sctx;
+    EVP_CIPHER_CTX *ctx;
+    const EVP_CIPHER *ecipher;
+
+    if (pool) {
+        *psctx = sctx = apr_palloc(pool, sizeof(cprng_stream_ctx_t));
     }
     else {
-        *outlen = len;
+        *psctx = sctx = malloc(sizeof(cprng_stream_ctx_t));
     }
-#if APR_USE_OPENSSL_PRE_1_1_API
-    EVP_CIPHER_CTX_cleanup(ctx->cipherCtx);
+    if (!sctx) {
+        return APR_ENOMEM;
+    }
+
+    sctx->ctx = ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        return APR_ENOMEM;
+    }
+
+    /* We only handle Chacha20 and AES256-CTR stream ciphers, for now.
+     * AES256-CTR should be in any openssl version of this century but is used
+     * only if Chacha20 is missing (openssl < 1.1). This is because Chacha20 is
+     * fast (enough) in software and timing attacks safe, though AES256-CTR can
+     * be faster and constant-time but only when the CPU (aesni) or some crypto
+     * hardware are in place.
+     */
+    switch (cipher) {
+    case APR_CRYPTO_CIPHER_AUTO: {
+#if defined(NID_chacha20)
+        ecipher = EVP_chacha20();
+#elif defined(NID_aes_256_ctr)
+        ecipher = EVP_aes_256_ctr();
 #else
-    EVP_CIPHER_CTX_reset(ctx->cipherCtx);
+        return APR_ENOCIPHER;
 #endif
+    }
+    case APR_CRYPTO_CIPHER_AES_256_CTR: {
+#if defined(NID_aes_256_ctr)
+        ecipher = EVP_aes_256_ctr();
+        break;
+#else
+        return APR_ENOCIPHER;
+#endif
+    }
+    case APR_CRYPTO_CIPHER_CHACHA20_CTR: {
+#if defined(NID_chacha20)
+        ecipher = EVP_chacha20();
+        break;
+#else
+        return APR_ENOCIPHER;
+#endif
+    }
+    default: {
+        return APR_ENOCIPHER;
+    }
+    }
 
-    return rc;
+    if (EVP_EncryptInit_ex(ctx, ecipher, f->config->engine, NULL, NULL) <= 0) {
+        EVP_CIPHER_CTX_free(ctx);
+        return APR_ENOMEM;
+    }
 
+    return APR_SUCCESS;
+}
+
+void cprng_stream_ctx_free(cprng_stream_ctx_t *sctx)
+{
+    EVP_CIPHER_CTX_free(sctx->ctx);
+}
+
+static APR_INLINE
+void cprng_stream_setkey(cprng_stream_ctx_t *sctx,
+                         const unsigned char *key,
+                         const unsigned char *iv)
+{
+#if defined(NID_chacha20)
+    /* With CHACHA20, iv=NULL is the same as zeros but it's faster
+     * to (re-)init; use that for efficiency.
+     */
+    EVP_EncryptInit_ex(sctx->ctx, NULL, NULL, key, NULL);
+#else
+    /* With AES256-CTR, iv=NULL seems to peek up and random one (for
+     * the initial CTR), while we can live with zeros (fixed CTR);
+     * efficiency still.
+     */
+    EVP_EncryptInit_ex(sctx->ctx, NULL, NULL, key, iv);
+#endif
+}
+
+static apr_status_t cprng_stream_ctx_bytes(cprng_stream_ctx_t **pctx,
+        unsigned char *key, unsigned char *to, apr_size_t n, const unsigned char *z)
+{
+    cprng_stream_ctx_t *sctx = *pctx;
+    int len;
+
+    /* We never encrypt twice with the same key, so no IV is needed (can
+     * be zeros). When EVP_EncryptInit() is called multiple times it clears
+     * its previous resources appropriately, and since we don't want the key
+     * and its keystream to reside in memory at the same time, we have to
+     * EVP_EncryptInit() twice: firstly to set the key and then finally to
+     * overwrite the key (with zeros) after the keystream is produced.
+     * As for EVP_EncryptFinish(), we don't need it either because padding
+     * is disabled (irrelevant for a stream cipher).
+     */
+    cprng_stream_setkey(sctx, key, z);
+    EVP_CIPHER_CTX_set_padding(sctx->ctx, 0);
+    EVP_EncryptUpdate(sctx->ctx, key, &len, z, CPRNG_KEY_SIZE);
+    if (n) {
+        EVP_EncryptUpdate(sctx->ctx, to, &len, z, n);
+    }
+    cprng_stream_setkey(sctx, z, z);
+
+    return APR_SUCCESS;
 }
 
 /**
  * OpenSSL module.
  */
 APR_MODULE_DECLARE_DATA const apr_crypto_driver_t apr_crypto_openssl_driver = {
-    "openssl", crypto_init, crypto_make, crypto_get_block_key_types,
+    "openssl", crypto_init, crypto_make, crypto_get_block_key_digests, crypto_get_block_key_types,
     crypto_get_block_key_modes, crypto_passphrase,
     crypto_block_encrypt_init, crypto_block_encrypt,
     crypto_block_encrypt_finish, crypto_block_decrypt_init,
     crypto_block_decrypt, crypto_block_decrypt_finish,
-    crypto_block_cleanup, crypto_cleanup, crypto_shutdown, crypto_error,
-    crypto_key
+    crypto_digest_init, crypto_digest_update, crypto_digest_final, crypto_digest,
+    crypto_block_cleanup, crypto_digest_cleanup, crypto_cleanup, crypto_shutdown, crypto_error,
+    crypto_key, cprng_stream_ctx_make, cprng_stream_ctx_free, cprng_stream_ctx_bytes
 };
 
 #endif

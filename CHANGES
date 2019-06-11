@@ -1,6 +1,57 @@
                                                      -*- coding: utf-8 -*-
 Changes for APR 2.0.0
 
+  *) Windows platform: Use the native XML parser implementation (XmlLite)
+     by default instead of libxml2 and expat. [Ivan Zhakov]
+
+  *) Fix handle leak in the Win32 apr_uid_current implementation.
+     PR 61165. [Ivan Zhakov]
+
+  *) apr_rwlock_t: Use native Slim Reader/Writer (SRW) locks on Windows.
+     PR 51360. [Ivan Zhakov]
+
+  *) Fix possible race condition in the Win32 apr_rwlock_t implementation.
+     PR 45455. [Ivan Zhakov]
+
+  *) apr_thread_once: Fix problem that apr_thread_once can return before
+     the other thread completes initialization on Windows.
+
+  *) Windows platform: Remove support for Windows 2000, XP, Vista. The minimum
+     supported OS versions are now Windows 7 / Windows Server 2008 R2.
+
+  *) apr_file_info: [Win32 only] Treat only "name surrogate" reparse points
+     as symlinks, and not other reparse tag types. PR47630
+     [Oleg Liatte <olegliatte gmail.com>]
+
+  *) Test %ld vs. %lld to avoid compiler emits using APR_OFF_T_FMT, in the
+     case of apparently equivilant long and long long types. [William Rowe] 
+
+  *) Recognize APPLE predefined macros as equivilant to DARWIN. [Jim Jagielski]
+
+  *) Signals: Allow handling of SIGUSR2 in apr_signal_thread. [Yann Ylavic]
+
+  *) Atomics: Support for 64bit ints. [Jim Jagielski]
+
+  *) apr_jose: Add support for encoding and decoding of JSON Object
+     Signing and Encryption messages as per RFC7515, RFC7516, RFC7517
+     and RFC7519. [Graham Leggett]
+
+  *) Add apr_errprintf() as a convenience function to create and
+     populate apu_err_t. [Graham Leggett]
+
+  *) apr_crypto: Add support for digest functions, with hashing, signing
+     and verifying. [Graham Leggett]
+
+  *) apr_json: Add support for encoding and decoding RFC8259 JSON.
+     [Moriyoshi Koizumi <mozo mozo jp>]
+
+  *) Add the apr_encode_* API that implements RFC4648 and RFC7515
+     compliant BASE64, BASE64URL, BASE32, BASE32HEX and BASE16
+     encode/decode functions. [Graham Leggett]
+
+  *) Add apr_reslist_acquire_ex() which allows to control acquire order,
+     that is LIFO (default) or FIFO.  [Yann Ylavic]
+
   *) apr_file_write: Optimize large reads from buffered files on Windows.
      [Evgeny Kotkov]
 

@@ -47,6 +47,10 @@
 #include <tlhelp32.h>
 #endif
 
+#if defined(HAVE_IF_INDEXTONAME) && defined(_MSC_VER)
+#include <Iphlpapi.h>
+#endif
+
 struct apr_other_child_rec_t {
     apr_pool_t *p;
     struct apr_other_child_rec_t *next;
@@ -168,14 +172,20 @@ static APR_INLINE void* apr_realloc_dbg(void* userData, size_t newSize,
 
 #endif  /* ! _MSC_VER */
 
+/* Wrapper around WaitForSingleObject() that accepts apr_interval_time_t
+ * in microseconds instead of milliseconds. Values < 0 mean wait 
+ * forever, 0 means do not wait at all. */
+DWORD apr_wait_for_single_object(HANDLE handle, apr_interval_time_t timeout);
+
 typedef enum {
     DLL_WINBASEAPI = 0,    /* kernel32 From WinBase.h       */
     DLL_WINADVAPI = 1,     /* advapi32 From WinBase.h       */
     DLL_WINSOCKAPI = 2,    /* mswsock  From WinSock.h       */
     DLL_WINSOCK2API = 3,   /* ws2_32   From WinSock2.h      */
     DLL_SHSTDAPI = 4,      /* shell32  From ShellAPI.h      */
-    DLL_NTDLL = 5,         /* shell32  From our real kernel */
-    DLL_defined = 6        /* must define as last idx_ + 1  */
+    DLL_NTDLL = 5,         /* ntdll    From our real kernel */
+    DLL_IPHLPAPI = 6,      /* Iphlpapi From Iphlpapi.h      */
+    DLL_defined = 7        /* must define as last idx_ + 1  */
 } apr_dlltoken_e;
 
 FARPROC apr_load_dll_func(apr_dlltoken_e fnLib, char *fnName, int ordinal);
@@ -225,27 +235,6 @@ FARPROC apr_load_dll_func(apr_dlltoken_e fnLib, char *fnName, int ordinal);
  * these we must always look up
  */
 
-#ifdef GetCompressedFileSizeA
-#undef GetCompressedFileSizeA
-#endif
-APR_DECLARE_LATE_DLL_FUNC(DLL_WINBASEAPI, DWORD, WINAPI, GetCompressedFileSizeA, 0, (
-    IN LPCSTR lpFileName,
-    OUT LPDWORD lpFileSizeHigh),
-    (lpFileName, lpFileSizeHigh));
-#define GetCompressedFileSizeA apr_winapi_GetCompressedFileSizeA
-#undef GetCompressedFileSize
-#define GetCompressedFileSize apr_winapi_GetCompressedFileSizeA
-
-#ifdef GetCompressedFileSizeW
-#undef GetCompressedFileSizeW
-#endif
-APR_DECLARE_LATE_DLL_FUNC(DLL_WINBASEAPI, DWORD, WINAPI, GetCompressedFileSizeW, 0, (
-    IN LPCWSTR lpFileName,
-    OUT LPDWORD lpFileSizeHigh),
-    (lpFileName, lpFileSizeHigh));
-#define GetCompressedFileSizeW apr_winapi_GetCompressedFileSizeW
-
-
 APR_DECLARE_LATE_DLL_FUNC(DLL_NTDLL, LONG, WINAPI, NtQueryTimerResolution, 0, (
     ULONG *pMaxRes,  /* Minimum NS Resolution */
     ULONG *pMinRes,  /* Maximum NS Resolution */
@@ -287,30 +276,14 @@ APR_DECLARE_LATE_DLL_FUNC(DLL_NTDLL, LONG, WINAPI, NtQueryObject, 0, (
     (hObject, info, pOI, LenOI, pSizeOI));
 #define QueryObject apr_winapi_NtQueryObject
 
-typedef struct IOSB {
-    union {
-    UINT Status;
-    PVOID reserved;
-    };
-    apr_uintptr_t Information; /* Varies by op, consumed buffer size for FSI below */
-} IOSB, *PIOSB;
-
-typedef struct FSI {
-    LONGLONG AllocationSize;
-    LONGLONG EndOfFile;
-    ULONG    NumberOfLinks;
-    BOOL     DeletePending;
-    BOOL     Directory;
-} FSI, *PFSI;
-
-APR_DECLARE_LATE_DLL_FUNC(DLL_NTDLL, LONG, WINAPI, ZwQueryInformationFile, 0, (
-    HANDLE hObject,    /* Obvious */
-    PVOID  pIOSB,      /* Point to the IOSB buffer for detailed return results */
-    PVOID  pFI,        /* The buffer, using FIB above */
-    ULONG  LenFI,      /* Use sizeof(FI) */
-    ULONG  info),      /* Use 5 for FSI documented above*/
-    (hObject, pIOSB, pFI, LenFI, info));
-#define ZwQueryInformationFile apr_winapi_ZwQueryInformationFile
+/* https://docs.microsoft.com/en-us/windows/desktop/api/winternl/nf-winternl-ntwaitforsingleobject */
+APR_DECLARE_LATE_DLL_FUNC(DLL_NTDLL, LONG, WINAPI, NtWaitForSingleObject, 0, (
+    HANDLE Handle,          /* The handle to the wait object. */
+    BOOLEAN Alertable,      /* Specifies whether an alert can be delivered when
+                               the object is waiting. */
+    PLARGE_INTEGER Timeout),/* A pointer to an absolute or relative time over
+                               which the wait is to occur.  */
+    (Handle, Alertable, Timeout));
 
 #ifdef CreateToolhelp32Snapshot
 #undef CreateToolhelp32Snapshot
@@ -339,47 +312,24 @@ APR_DECLARE_LATE_DLL_FUNC(DLL_WINBASEAPI, BOOL, WINAPI, Process32NextW, 0, (
     (hSnapshot, lppe));
 #define Process32NextW apr_winapi_Process32NextW
 
-#if !defined(POLLERR)
-/* Event flag definitions for WSAPoll(). */
-#define POLLRDNORM  0x0100
-#define POLLRDBAND  0x0200
-#define POLLIN      (POLLRDNORM | POLLRDBAND)
-#define POLLPRI     0x0400
-
-#define POLLWRNORM  0x0010
-#define POLLOUT     (POLLWRNORM)
-#define POLLWRBAND  0x0020
-
-#define POLLERR     0x0001
-#define POLLHUP     0x0002
-#define POLLNVAL    0x0004
-
-typedef struct pollfd {
-    SOCKET  fd;
-    SHORT   events;
-    SHORT   revents;
-
-} WSAPOLLFD, *PWSAPOLLFD, FAR *LPWSAPOLLFD;
-
-#endif /* !defined(POLLERR) */
-#ifdef WSAPoll
-#undef WSAPoll
-#endif
-APR_DECLARE_LATE_DLL_FUNC(DLL_WINSOCK2API, int, WSAAPI, WSAPoll, 0, (
-    IN OUT LPWSAPOLLFD fdArray,
-    IN ULONG fds,
-    IN INT timeout),
-    (fdArray, fds, timeout));
-#define WSAPoll apr_winapi_WSAPoll
 #define HAVE_POLL   1
 
-#ifdef SetDllDirectoryW
-#undef SetDllDirectoryW
+#ifdef if_nametoindex
+#undef if_nametoindex
 #endif
-APR_DECLARE_LATE_DLL_FUNC(DLL_WINBASEAPI, BOOL, WINAPI, SetDllDirectoryW, 0, (
-    IN LPCWSTR lpPathName),
-    (lpPathName));
-#define SetDllDirectoryW apr_winapi_SetDllDirectoryW
+APR_DECLARE_LATE_DLL_FUNC(DLL_IPHLPAPI, NET_IFINDEX, WINAPI, if_nametoindex, 0, (
+    IN PCSTR InterfaceName),
+    (InterfaceName));
+#define if_nametoindex apr_winapi_if_nametoindex
+
+#ifdef if_indextoname
+#undef if_indextoname
+#endif
+APR_DECLARE_LATE_DLL_FUNC(DLL_IPHLPAPI, PCHAR, NETIOAPI_API_, if_indextoname, 0, (
+    NET_IFINDEX InterfaceIndex,
+    PCHAR       InterfaceName),
+    (InterfaceIndex, InterfaceName));
+#define if_indextoname apr_winapi_if_indextoname
 
 #endif /* !defined(_WIN32_WCE) */
 

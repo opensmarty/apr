@@ -278,16 +278,19 @@ case $host in
 AC_LIBTOOL_WIN32_DLL
 AC_PROG_LIBTOOL
         # get libtool's setting of shlibpath_var
-        eval `grep "^shlibpath_var=[[A-Z_]]*$" $apr_builddir/libtool`
         if test "x$shlibpath_var" = "x"; then
+            eval `grep "^shlibpath_var=[[A-Z_]]*$" $apr_builddir/libtool`
+        fi
+        if test "x$shlibpath_var" = "x"; then
+            AC_MSG_NOTICE([SHLIBPATH variable could not be determined])
             shlibpath_var=REPLACE_WITH_YOUR_SHLIBPATH_VAR
         fi
     fi
     ;;
 esac
 
-AC_ARG_WITH(installbuilddir, [  --with-installbuilddir=DIR location to store APR build files (defaults to '${datadir}/build')],
-  [ installbuilddir=$withval ], [ installbuilddir="${datadir}/build-${APR_MAJOR_VERSION}" ] )
+AC_ARG_WITH(installbuilddir, [  --with-installbuilddir=DIR location to store APR build files],
+  [ installbuilddir=$withval ] )
 AC_SUBST(installbuilddir)
 
 AC_ARG_WITH(libtool, [  --without-libtool       avoid using libtool to link the library],
@@ -835,15 +838,13 @@ else
     fi
 fi
 
-ac_cv_define_READDIR_IS_THREAD_SAFE=no
+ac_cv_define_READDIR_IS_THREAD_SAFE=yes
 ac_cv_define_GETHOSTBYNAME_IS_THREAD_SAFE=no
 ac_cv_define_GETHOSTBYADDR_IS_THREAD_SAFE=no
 ac_cv_define_GETSERVBYNAME_IS_THREAD_SAFE=no
 if test "$threads" = "1"; then
     AC_MSG_NOTICE([APR will use threads])
-    AC_CHECK_LIB(c_r, readdir,
-        AC_DEFINE(READDIR_IS_THREAD_SAFE, 1, 
-                  [Define if readdir is thread safe]))
+    AC_DEFINE(READDIR_IS_THREAD_SAFE, 1, [Modern readdir is thread safe])
     if test "x$apr_gethostbyname_is_thread_safe" = "x"; then
         AC_CHECK_LIB(c_r, gethostbyname, apr_gethostbyname_is_thread_safe=yes)
     fi
@@ -1398,7 +1399,8 @@ APR_FLAG_HEADERS(
     errno.h		\
     fcntl.h		\
     grp.h		\
-    ifaddrs.h           \
+    ifaddrs.h		\
+    inttypes.h		\
     io.h		\
     limits.h		\
     mach-o/dyld.h	\
@@ -1492,8 +1494,9 @@ AC_SUBST(crypth)
 AC_SUBST(errnoh)
 AC_SUBST(direnth)
 AC_SUBST(fcntlh)
-AC_SUBST(ioh)
 AC_SUBST(ifaddrsh)
+AC_SUBST(inttypesh)
+AC_SUBST(ioh)
 AC_SUBST(limitsh)
 AC_SUBST(mswsockh)
 AC_SUBST(netdbh)
@@ -1591,9 +1594,9 @@ fi
 
 dnl Checks for integer size
 AC_CHECK_SIZEOF(char, 1)
+AC_CHECK_SIZEOF(short, 2)
 AC_CHECK_SIZEOF(int, 4)
 AC_CHECK_SIZEOF(long, 4)
-AC_CHECK_SIZEOF(short, 2)
 AC_CHECK_SIZEOF(long long, 8)
 
 if test "$ac_cv_sizeof_short" = "2"; then
@@ -1602,16 +1605,37 @@ fi
 if test "$ac_cv_sizeof_int" = "4"; then
     int_value=int
 fi
+
 # Now we need to find what apr_int64_t (sizeof == 8) will be.
-# The first match is our preference.
-if test "$ac_cv_sizeof_int" = "8"; then
+# The first match is our preference (use inttypes if available).
+APR_IFALLYES(header:stdint.h header:inttypes.h, hasinttypes="1", hasinttypes="0")
+if test "$hasinttypes" = "1"; then
+    int64_literal='#define APR_INT64_C(val) INT64_C(val)'
+    uint64_literal='#define APR_UINT64_C(val) UINT64_C(val)'
+    int64_t_fmt='#define APR_INT64_T_FMT PRId64'
+    uint64_t_fmt='#define APR_UINT64_T_FMT PRIu64'
+    uint64_t_hex_fmt='#define APR_UINT64_T_HEX_FMT PRIx64'
+    int64_value="int64_t"
+    uint64_value="uint64_t"
+    APR_CHECK_TYPES_FMT_COMPATIBLE(int64_t, int, d, [
+        int64_strfn="strtoi"
+    ], [
+    APR_CHECK_TYPES_FMT_COMPATIBLE(int64_t, long, ld, [
+        int64_strfn="strtol"
+    ], [
+    APR_CHECK_TYPES_FMT_COMPATIBLE(int64_t, long long, lld, [
+        int64_strfn="strtoll"
+    ], [
+        AC_ERROR([could not determine the string function for int64_t])
+    ])])])
+elif test "$ac_cv_sizeof_int" = "8"; then
     int64_literal='#define APR_INT64_C(val) (val)'
     uint64_literal='#define APR_UINT64_C(val) (val##U)'
     int64_t_fmt='#define APR_INT64_T_FMT "d"'
     uint64_t_fmt='#define APR_UINT64_T_FMT "u"'
     uint64_t_hex_fmt='#define APR_UINT64_T_HEX_FMT "x"'
     int64_value="int"
-    long_value=int
+    uint64_value="unsigned int"
     int64_strfn="strtoi"
 elif test "$ac_cv_sizeof_long" = "8"; then
     int64_literal='#define APR_INT64_C(val) (val##L)'
@@ -1620,7 +1644,7 @@ elif test "$ac_cv_sizeof_long" = "8"; then
     uint64_t_fmt='#define APR_UINT64_T_FMT "lu"'
     uint64_t_hex_fmt='#define APR_UINT64_T_HEX_FMT "lx"'
     int64_value="long"
-    long_value=long
+    uint64_value="unsigned long"
     int64_strfn="strtol"
 elif test "$ac_cv_sizeof_long_long" = "8"; then
     int64_literal='#define APR_INT64_C(val) (val##LL)'
@@ -1633,7 +1657,7 @@ elif test "$ac_cv_sizeof_long_long" = "8"; then
     uint64_t_fmt='#define APR_UINT64_T_FMT "llu"'
     uint64_t_hex_fmt='#define APR_UINT64_T_HEX_FMT "llx"'
     int64_value="long long"
-    long_value="long long"
+    uint64_value="unsigned long long"
     int64_strfn="strtoll"
 elif test "$ac_cv_sizeof_longlong" = "8"; then
     int64_literal='#define APR_INT64_C(val) (val##LL)'
@@ -1642,7 +1666,7 @@ elif test "$ac_cv_sizeof_longlong" = "8"; then
     uint64_t_fmt='#define APR_UINT64_T_FMT "qu"'
     uint64_t_hex_fmt='#define APR_UINT64_T_HEX_FMT "qx"'
     int64_value="__int64"
-    long_value="__int64"
+    uint64_value="unsigned __int64"
     int64_strfn="strtoll"
 else
     # int64_literal may be overriden if your compiler thinks you have
@@ -1760,18 +1784,22 @@ case $host in
         uint64_t_fmt='#define APR_UINT64_T_FMT "I64u"'
         uint64_t_hex_fmt='#define APR_UINT64_T_HEX_FMT "I64x"'
         int64_value="__int64"
-        long_value="__int64"
+        uint64_value="unsigned __int64"
         int64_strfn="_strtoi64"
         ;;
 esac
 
-APR_CHECK_TYPES_COMPATIBLE(ssize_t, int, [ssize_t_fmt="d"])
-APR_CHECK_TYPES_COMPATIBLE(ssize_t, long, [ssize_t_fmt="ld"])
-APR_CHECK_TYPES_COMPATIBLE(size_t, unsigned int, [size_t_fmt="u"])
-APR_CHECK_TYPES_COMPATIBLE(size_t, unsigned long, [size_t_fmt="lu"])
+dnl I would expect much of the above to go away with new compile test
+APR_CHECK_TYPES_FMT_COMPATIBLE(ssize_t, long, ld, [ssize_t_fmt="ld"], [
+APR_CHECK_TYPES_FMT_COMPATIBLE(ssize_t, int, d, [ssize_t_fmt="d"])
+])
+APR_CHECK_TYPES_FMT_COMPATIBLE(size_t, unsigned long, lu, [size_t_fmt="lu"], [
+APR_CHECK_TYPES_FMT_COMPATIBLE(size_t, unsigned int, u, [size_t_fmt="u"])
+])
 
 APR_CHECK_SIZEOF_EXTENDED([#include <sys/types.h>], ssize_t, 8)
 
+dnl the else cases below should no longer occur;
 AC_MSG_CHECKING([which format to use for apr_ssize_t])
 if test -n "$ssize_t_fmt"; then
     AC_MSG_RESULT(%$ssize_t_fmt)
@@ -1789,6 +1817,7 @@ ssize_t_fmt="#define APR_SSIZE_T_FMT \"$ssize_t_fmt\""
 
 APR_CHECK_SIZEOF_EXTENDED([#include <stddef.h>], size_t, 8)
 
+# else cases below should no longer occur;
 AC_MSG_CHECKING([which format to use for apr_size_t])
 if test -n "$size_t_fmt"; then
     AC_MSG_RESULT(%$size_t_fmt)
@@ -1832,6 +1861,7 @@ if test "${ac_cv_sizeof_off_t}${apr_cv_use_lfs64}" = "4yes"; then
     off_t_fmt='#define APR_OFF_T_FMT APR_INT64_T_FMT'
     off_t_value='off64_t'
     off_t_strfn='apr_strtoi64'
+    off_t_size=8
 elif test "${ac_cv_sizeof_off_t}x${ac_cv_sizeof_long}" = "4x4"; then
     # Special case: off_t may change size with _FILE_OFFSET_BITS
     # on 32-bit systems with LFS support.  To avoid compatibility
@@ -1840,37 +1870,49 @@ elif test "${ac_cv_sizeof_off_t}x${ac_cv_sizeof_long}" = "4x4"; then
     off_t_value=long
     off_t_fmt='#define APR_OFF_T_FMT "ld"'
     off_t_strfn='strtol'
+    off_t_size="$ac_cv_sizeof_long"
 elif test "$ac_cv_type_off_t" = "yes"; then
-    off_t_value=off_t
     # off_t is more commonly a long than an int; prefer that case
-    # where int and long are the same size.
-    if test "$ac_cv_sizeof_off_t" = "$ac_cv_sizeof_long"; then
-        off_t_fmt='#define APR_OFF_T_FMT "ld"'
+    # where int and long are the same size and interchangable.
+    off_t_value=off_t
+    off_t_size="$ac_cv_sizeof_off_t"
+    APR_CHECK_TYPES_FMT_COMPATIBLE(off_t, long, ld, [
+        off_t_fmt="#define APR_OFF_T_FMT \"ld\""
         off_t_strfn='strtol'
-    elif test "$ac_cv_sizeof_off_t" = "$ac_cv_sizeof_int"; then
-        off_t_fmt='#define APR_OFF_T_FMT "d"'
+    ], [
+    APR_CHECK_TYPES_FMT_COMPATIBLE(off_t, int, d, [
+        off_t_fmt="#define APR_OFF_T_FMT \"d\""
         off_t_strfn='strtoi'
-    elif test "$ac_cv_sizeof_off_t" = "$ac_cv_sizeof_long_long"; then
-        off_t_fmt='#define APR_OFF_T_FMT APR_INT64_T_FMT'
-        off_t_strfn='apr_strtoi64'
-    else
-        AC_ERROR([could not determine the size of off_t])
-    fi
+    ], [
+    APR_CHECK_TYPES_FMT_COMPATIBLE(off_t, long long, lld, [
+        off_t_fmt="#define APR_OFF_T_FMT \"lld\""
+        off_t_strfn='strtoll'
+    ], [
+    APR_CHECK_TYPES_FMT_COMPATIBLE(off_t, $int64_value, I64d, [
+        off_t_fmt="#define APR_OFF_T_FMT APR_INT64_T_FMT"
+        off_t_strfn='apr_strtoi64'], [
     # Per OS tuning...
     case $host in
     *-mingw*)
         off_t_value=apr_int64_t
         off_t_fmt='#define APR_OFF_T_FMT "I64d"'
         off_t_strfn='_strtoi64'
+        off_t_size=8
+        ;;
+    *)
+        AC_ERROR([could not determine the size of off_t])
         ;;
     esac
+    ])])])])
 else
     # Fallback on int
-    off_t_value=apr_int64_t
+    off_t_value=int
     off_t_fmt='#define APR_OFF_T_FMT "d"'
     off_t_strfn='strtoi'
+    off_t_size=4
 fi
 AC_MSG_RESULT($off_t_value)
+
 
 # Regardless of whether _LARGEFILE64_SOURCE is used, on some
 # platforms _FILE_OFFSET_BITS will affect the size of ino_t and hence
@@ -1922,8 +1964,8 @@ fi
 AC_SUBST(voidp_size)
 AC_SUBST(short_value)
 AC_SUBST(int_value)
-AC_SUBST(long_value)
 AC_SUBST(int64_value)
+AC_SUBST(uint64_value)
 AC_SUBST(off_t_value)
 AC_SUBST(size_t_value)
 AC_SUBST(ssize_t_value)
@@ -1942,6 +1984,7 @@ AC_SUBST(bigendian)
 AC_SUBST(aprlfs)
 AC_SUBST(have_iovec)
 AC_SUBST(ino_t_value)
+AC_SUBST(off_t_size)
 
 dnl ----------------------------- Checking for string functions
 AC_CHECK_FUNCS(strnicmp, have_strnicmp="1", have_strnicmp="0")
@@ -2302,6 +2345,14 @@ APR_IFALLYES(func:semget func:semctl func:semop define:SEM_UNDO,
             APR_DECIDE(USE_SYSVSEM_SERIALIZE, [SysV IPC semget()]))
 APR_IFALLYES(header:OS.h func:create_sem func:acquire_sem func:acquire_sem_etc, 
             APR_DECIDE(USE_BEOSSEM, [BeOS Semaphores])) 
+# pthread mutex both pshared and robust[_np] is the best default
+case "$apr_cv_mutex_robust_shared" in
+"yes"|"np")
+    APR_DECIDE(USE_PROC_PTHREAD_SERIALIZE, [pthread pshared mutex]) 
+    ;;
+*)
+    ;;
+esac
 if test "x$apr_lock_method" != "x"; then
     APR_DECISION_FORCE($apr_lock_method)
 fi
@@ -2489,25 +2540,25 @@ AC_ARG_WITH(egd,
 
 if test "$rand" != "1"; then
   if test "$ac_cv_func_getrandom" = yes; then
-    AC_MSG_RESULT(getrandom)
-    rand="1"
+    rand="getrandom"
   elif test "$ac_cv_have_decl_SYS_getrandom" = yes; then
-    AC_MSG_RESULT(SYS_getrandom)
-    rand="1"
-  fi
-fi
-
-if test "$rand" != "1"; then
-  if test "$ac_cv_func_arc4random_buf" = yes; then
-    AC_MSG_RESULT(arc4random)
-    rand="1"
+    rand="SYS_getrandom"
+  elif test "$ac_cv_func_arc4random_buf" = yes; then
+    rand="arc4random"
   fi
 fi
 
 if test "$rand" != "1"; then
   AC_ARG_WITH(devrandom,
     [  --with-devrandom[[=DEV]]  use /dev/random or compatible [[searches by default]]],
-    [ apr_devrandom="$withval" ], [ apr_devrandom="yes" ])
+    [ apr_devrandom="$withval" ], [ apr_devrandom="no" ])
+  if test "$apr_devrandom" = "no"; then
+    if test -z "$rand"; then
+      apr_devrandom="yes"
+    else
+      apr_devrandom="no"
+    fi
+  fi
 
   if test "$apr_devrandom" = "yes"; then
     # /dev/random on OpenBSD doesn't provide random data, so
@@ -2515,7 +2566,7 @@ if test "$rand" != "1"; then
     for f in /dev/arandom /dev/urandom /dev/random; do
       if test -r $f; then
         apr_devrandom=$f
-        rand=1
+        rand="1"
         break
       fi
     done
@@ -2541,6 +2592,10 @@ if test "$rand" != "1"; then
   if test "$rand" = "1"; then
     AC_DEFINE_UNQUOTED(DEV_RANDOM, ["$apr_devrandom"], [Define to path of random device])
     AC_MSG_RESULT([$apr_devrandom])
+  elif test -n "$rand"; then
+    AC_DEFINE_UNQUOTED(SYS_RANDOM, ["$rand"], [Define system call of random])
+    AC_MSG_RESULT([$rand])
+    rand="1"
   fi
 fi
 
